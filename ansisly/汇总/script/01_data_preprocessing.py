@@ -15,6 +15,8 @@ from lifelines import KaplanMeierFitter
 from scipy import stats
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
+import polars as pl
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "DATA"))
 RESULTS_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "results"))
@@ -397,45 +399,173 @@ def load_cnv():
     return patient_matrix
 
 
-def load_methylation():
+def load_methylation(probe_blacklist=None, min_iqr=0.0):
+    """加载 HM450 甲基化数据，使用 Polars + numpy 全链路优化。
+
+    Parameters
+    ----------
+    probe_blacklist : set/list/None
+        需要过滤的探针 ID 集合（如性染色体/交叉反应探针）
+    min_iqr : float
+        IQR 阈值，> 0 时启用低变异过滤；默认 0.0 不过滤
+    """
+    import time as _time
     meth_path = os.path.join(TCGA_DIR, "data_methylation_hm450.txt")
     if not os.path.exists(meth_path):
         raise FileNotFoundError(f"甲基化数据文件不存在: {meth_path}")
 
-    chunks = []
-    for chunk in pd.read_csv(meth_path, sep="\t", comment="#", dtype=str,
-                              low_memory=False, chunksize=5000):
-        chunks.append(chunk)
-    df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+    print("  [提示] 甲基化文件较大(~1.3GB)，使用 Polars+numpy 优化加载...")
+    _t0 = _time.time()
 
-    if df.empty:
-        raise ValueError("甲基化数据为空")
+    # ── Step 1: Polars 读取 ──────────────────────────────────────────
+    try:
+        df = pl.read_csv(
+            meth_path,
+            separator="\t",
+            comment_prefix="#",
+            infer_schema_length=10000,
+            ignore_errors=True,
+        )
+    except Exception:
+        # 回退：若 scan/read 不支持 comment_prefix，逐行过滤 # 开头
+        df = pl.read_csv(
+            meth_path,
+            separator="\t",
+            infer_schema_length=10000,
+            ignore_errors=True,
+        )
+        first_col = df.columns[0]
+        df = df.filter(~pl.col(first_col).cast(pl.Utf8).str.starts_with("#"))
 
+    _t1 = _time.time()
+    print(f"  Polars 读取完成: {_t1 - _t0:.1f}s, shape={df.shape}")
+
+    # ── Step 1b: 确定 ID 列和 sample 列 ─────────────────────────────
     id_col = df.columns[0]
     for candidate in ["Composite.Element.REF", "ENTITY_STABLE_ID", "ID", "Hugo_Symbol", "geneNames"]:
         if candidate in df.columns:
             id_col = candidate
             break
 
-    sample_cols = matrix_sample_columns(df.columns)
-    df = df[[id_col] + sample_cols].copy()
-    df = df[df[id_col].notna() & (df[id_col].astype(str).str.strip() != "")]
-    df[id_col] = df[id_col].astype(str)
+    sample_cols = [c for c in df.columns if c not in META_COLUMNS]
 
-    numeric = df.set_index(id_col).apply(pd.to_numeric, errors="coerce")
-    if numeric.index.has_duplicates:
-        numeric = numeric.groupby(level=0).mean()
+    # 选择 ID + sample 列，将 sample 列 cast 为 Float32
+    df = df.select([pl.col(id_col).cast(pl.Utf8)] + [pl.col(c).cast(pl.Float32) for c in sample_cols])
 
-    patient_matrix = numeric.T.copy()
-    patient_matrix.index = [patient_id_from_sample(c) for c in patient_matrix.index]
-    patient_matrix = patient_matrix.groupby(level=0).mean()
+    # 过滤空 ID
+    df = df.filter(pl.col(id_col).is_not_null() & (pl.col(id_col).str.strip_chars() != ""))
 
-    medians = patient_matrix.median(axis=0)
-    patient_matrix = patient_matrix.fillna(medians)
+    # 探针黑名单过滤
+    if probe_blacklist is not None and len(probe_blacklist) > 0:
+        blacklist_list = list(probe_blacklist)
+        df = df.filter(~pl.col(id_col).is_in(blacklist_list))
 
-    scaler = StandardScaler()
-    scaled_values = scaler.fit_transform(patient_matrix.values)
-    patient_matrix = pd.DataFrame(scaled_values, index=patient_matrix.index, columns=patient_matrix.columns)
+    _t2 = _time.time()
+    print(f"  列选择/类型转换完成: {_t2 - _t1:.1f}s")
+
+    # ── Step 2: 转 numpy 并处理重复探针 ─────────────────────────────
+    probe_ids = df[id_col].to_list()
+    values = df.select(sample_cols).to_numpy()  # shape: (~396K, ~570), float32
+    del df  # 释放 Polars DataFrame
+
+    # 重复探针聚合（按 probe_id groupby mean）
+    probe_ids_arr = np.array(probe_ids)
+    unique_probes, inverse_idx = np.unique(probe_ids_arr, return_inverse=True)
+    if len(unique_probes) < len(probe_ids_arr):
+        print(f"  发现重复探针: {len(probe_ids_arr)} -> {len(unique_probes)}，执行聚合...")
+        n_samples = values.shape[1]
+        agg_values = np.zeros((len(unique_probes), n_samples), dtype=np.float32)
+        agg_counts = np.zeros((len(unique_probes), n_samples), dtype=np.float32)
+        nan_mask_vals = np.isnan(values)
+        values_safe = np.where(nan_mask_vals, 0.0, values)
+        np.add.at(agg_values, inverse_idx, values_safe)
+        np.add.at(agg_counts, inverse_idx, (~nan_mask_vals).astype(np.float32))
+        values = np.where(agg_counts > 0, agg_values / np.clip(agg_counts, 1.0, None), np.nan)
+        probe_ids = list(unique_probes)
+        del agg_values, agg_counts, nan_mask_vals, values_safe
+    else:
+        probe_ids = list(unique_probes)
+
+    del probe_ids_arr, unique_probes, inverse_idx
+
+    # ── Step 3: numpy 层转置 + patient_id 聚合 ───────────────────────
+    transposed = np.ascontiguousarray(values.T)  # shape: (~570, ~396K), float32
+    del values
+
+    patient_ids_raw = [patient_id_from_sample(c) for c in sample_cols]
+    patient_ids_arr = np.array(patient_ids_raw)
+    unique_patients, patient_inverse = np.unique(patient_ids_arr, return_inverse=True)
+
+    if len(unique_patients) < len(patient_ids_raw):
+        print(f"  发现重复 patient_id: {len(patient_ids_raw)} -> {len(unique_patients)}，执行聚合...")
+        n_probes = transposed.shape[1]
+        agg_transposed = np.zeros((len(unique_patients), n_probes), dtype=np.float32)
+        agg_pat_counts = np.zeros((len(unique_patients), n_probes), dtype=np.float32)
+        nan_mask_trans = np.isnan(transposed)
+        transposed_safe = np.where(nan_mask_trans, 0.0, transposed)
+        np.add.at(agg_transposed, patient_inverse, transposed_safe)
+        np.add.at(agg_pat_counts, patient_inverse, (~nan_mask_trans).astype(np.float32))
+        transposed = np.where(agg_pat_counts > 0, agg_transposed / np.clip(agg_pat_counts, 1.0, None), np.nan)
+        del agg_transposed, agg_pat_counts, nan_mask_trans, transposed_safe
+
+    patient_ids = list(unique_patients)
+    del patient_ids_arr, unique_patients, patient_inverse
+
+    matrix = transposed  # shape: (n_patients, n_probes)
+    del transposed
+
+    _t3 = _time.time()
+    print(f"  转置/聚合完成: {_t3 - _t2:.1f}s, shape={matrix.shape}")
+
+    # 移除全 NaN 的探针列
+    col_not_all_nan = ~np.all(np.isnan(matrix), axis=0)
+    if not np.all(col_not_all_nan):
+        n_removed = int(np.sum(~col_not_all_nan))
+        matrix = matrix[:, col_not_all_nan]
+        probe_ids = [p for p, k in zip(probe_ids, col_not_all_nan) if k]
+        print(f"  移除全NaN探针列: {n_removed} 个")
+    del col_not_all_nan
+
+    # ── Step 4: 低变异过滤（可选） ───────────────────────────────────
+    if min_iqr > 0:
+        q75 = np.nanpercentile(matrix, 75, axis=0)
+        q25 = np.nanpercentile(matrix, 25, axis=0)
+        iqr = q75 - q25
+        keep_mask = iqr >= min_iqr
+        n_before = matrix.shape[1]
+        matrix = matrix[:, keep_mask]
+        probe_ids = [p for p, k in zip(probe_ids, keep_mask) if k]
+        print(f"  低变异过滤(IQR>={min_iqr}): {n_before} -> {matrix.shape[1]} 探针")
+        del q75, q25, iqr, keep_mask
+
+    # ── Step 5: numpy 层缺失值填充 ───────────────────────────────────
+    medians = np.nanmedian(matrix, axis=0)
+    # 若某列全 NaN，nanmedian 返回 NaN，需用全局中位数回退
+    nan_medians = np.isnan(medians)
+    if nan_medians.any():
+        global_median = np.nanmedian(matrix)
+        if np.isnan(global_median):
+            global_median = 0.0
+        medians = np.where(nan_medians, global_median, medians)
+    nan_mask = np.isnan(matrix)
+    if nan_mask.any():
+        matrix = np.where(nan_mask, medians, matrix)
+        n_filled = int(nan_mask.sum())
+        print(f"  缺失值填充: {n_filled} 个值")
+    del medians, nan_mask, nan_medians
+
+    # ── Step 6: numpy 层标准化 ───────────────────────────────────────
+    mean = np.nanmean(matrix, axis=0)
+    std = np.nanstd(matrix, axis=0)
+    matrix = (matrix - mean) / np.clip(std, EPS, None)
+    del mean, std
+
+    # ── Step 7: 构造最终 DataFrame ───────────────────────────────────
+    patient_matrix = pd.DataFrame(matrix, index=patient_ids, columns=probe_ids)
+    del matrix
+
+    _t_end = _time.time()
+    print(f"  甲基化加载总耗时: {_t_end - _t0:.1f}s, 最终shape={patient_matrix.shape}")
 
     return patient_matrix
 
@@ -542,6 +672,11 @@ def save_preprocessed(output_dir, clinical_df, gene_df, gene_names, mutation_df,
 
     if methylation_df is not None and not methylation_df.empty:
         methylation_df.to_csv(os.path.join(output_dir, "methylation_curated.tsv"), sep="\t")
+        # Parquet 缓存（加速后续加载）
+        try:
+            methylation_df.to_parquet(os.path.join(output_dir, "methylation_curated.parquet"), engine="pyarrow")
+        except Exception as e:
+            print(f"  [WARNING] Parquet缓存保存失败: {e}")
 
     if rppa_df is not None and not rppa_df.empty:
         rppa_df.to_csv(os.path.join(output_dir, "rppa_curated.tsv"), sep="\t")

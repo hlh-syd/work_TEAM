@@ -120,6 +120,11 @@ def train_variance_screen(feature_df, train_ids, min_nonmissing=0.7, top_k=2000)
 
 
 def univariate_cox(clinical, features, time_col, event_col, min_events=5, min_unique=3):
+    # 防御性检查：如果features为空，直接返回空DataFrame
+    if features.empty or len(features.columns) == 0:
+        print("  [WARNING] univariate_cox 输入特征为空，跳过分析")
+        return pd.DataFrame(columns=["feature", "n", "events", "coef", "hr", "p", "ph_p", "status", "fdr", "likely_pseudogene"])
+    
     clin = clinical[["PATIENT_ID", time_col, event_col]].copy()
     clin["PATIENT_ID"] = clin["PATIENT_ID"].astype(str)
     clin[time_col] = pd.to_numeric(clin[time_col], errors="coerce")
@@ -163,6 +168,10 @@ def univariate_cox(clinical, features, time_col, event_col, min_events=5, min_un
                          "coef": np.nan, "hr": np.nan, "p": np.nan, "ph_p": np.nan,
                          "status": f"cox_failed:{type(exc).__name__}"})
     out = pd.DataFrame(rows)
+    # 防御性检查：如果out为空，返回完整结构的空DataFrame
+    if out.empty:
+        print("  [WARNING] univariate_cox 分析结果为空（所有特征都被过滤）")
+        return pd.DataFrame(columns=["feature", "n", "events", "coef", "hr", "p", "ph_p", "status", "fdr", "likely_pseudogene"])
     ok = out["status"] == "ok"
     out["fdr"] = np.nan
     if ok.any():
@@ -635,8 +644,14 @@ def main():
 
     if os.path.exists(split_path):
         split = pd.read_csv(split_path, sep="\t")
-        train_ids = split.loc[split["split"] == "train", "PATIENT_ID"].astype(str).tolist()
-        print(f"[02] Using predefined split: n_train={len(train_ids)}")
+        train_ids_from_file = split.loc[split["split"] == "train", "PATIENT_ID"].astype(str).tolist()
+        # 防御性检查：只保留在feature_df中存在的train_ids
+        feature_ids = set(feature_df.index.astype(str))
+        train_ids = [pid for pid in train_ids_from_file if pid in feature_ids]
+        print(f"[02] Using predefined split: n_train_from_file={len(train_ids_from_file)}, n_train_after_intersection={len(train_ids)}")
+        if len(train_ids) < 30:
+            print(f"[02] WARNING: Train样本过少 ({len(train_ids)}), 回退到使用全部样本")
+            train_ids = feature_df.index.astype(str).tolist()
     else:
         train_ids = clinical["PATIENT_ID"].astype(str).tolist()
         print(f"[02] No split file found, using full cohort: n={len(train_ids)}")
@@ -658,15 +673,24 @@ def main():
     univ.to_csv(os.path.join(out_dir, "tcga_univariable_cox_feature_screening.tsv"), sep="\t", index=False)
     print(f"[02] Univariable Cox: {len(univ)} features tested")
 
-    univ_ok = univ[univ["status"] == "ok"].copy()
-    ok = univ_ok[univ_ok["fdr"].notna()]
-    fdr_sig = ok[ok["fdr"] <= 0.20].sort_values("fdr")
-    fdr_sig = fdr_sig[~fdr_sig["likely_pseudogene"]].head(30)
-    if fdr_sig.empty:
-        print("[02] No FDR-significant genes, falling back to top-30 by p-value...")
-        fdr_sig = ok[~ok["likely_pseudogene"]].sort_values("p").head(30)
-    candidate_features = fdr_sig["feature"].tolist()
-    print(f"[02] FDR-passed candidates: {len(candidate_features)}")
+    # 防御性检查：如果univ为空或没有'ok'状态，回退到直接使用方差top基因
+    if univ.empty or "status" not in univ.columns or not (univ["status"] == "ok").any():
+        print("[02] WARNING: Univariable Cox 没有可用的候选特征，回退到方差top30基因...")
+        # 直接从方差排序结果中取top30
+        variance_sorted = variance_diag[variance_diag["selected_for_univariable_cox"]].copy()
+        variance_sorted = variance_sorted.sort_values("train_variance", ascending=False)
+        candidate_features = variance_sorted["feature"].head(30).tolist()
+        print(f"[02] Fallback candidates (top variance): {len(candidate_features)}")
+    else:
+        univ_ok = univ[univ["status"] == "ok"].copy()
+        ok = univ_ok[univ_ok["fdr"].notna()]
+        fdr_sig = ok[ok["fdr"] <= 0.20].sort_values("fdr")
+        fdr_sig = fdr_sig[~fdr_sig["likely_pseudogene"]].head(30)
+        if fdr_sig.empty:
+            print("[02] No FDR-significant genes, falling back to top-30 by p-value...")
+            fdr_sig = ok[~ok["likely_pseudogene"]].sort_values("p").head(30)
+        candidate_features = fdr_sig["feature"].tolist()
+        print(f"[02] FDR-passed candidates: {len(candidate_features)}")
 
     if not candidate_features:
         print("[02] No candidates passed screening. Saving empty outputs.")
@@ -703,9 +727,10 @@ def main():
         train_clinical_ids = [pid for pid in train_ids if pid in clinical_adj["PATIENT_ID"].astype(str).values]
         adj_cols = [c for c in ["AGE", "SEX", "AJCC_PATHOLOGIC_TUMOR_STAGE"] if c in clinical_adj.columns]
         if adj_cols and train_clinical_ids:
-            clin_adj = clinical_adj.set_index("PATIENT_ID").loc[
-                clinical_adj["PATIENT_ID"].astype(str).isin(train_clinical_ids), adj_cols
-            ].copy()
+            # 修复：先设置索引，然后用索引进行过滤
+            clin_indexed = clinical_adj.set_index("PATIENT_ID")
+            train_mask = clin_indexed.index.astype(str).isin(train_clinical_ids)
+            clin_adj = clin_indexed.loc[train_mask, adj_cols].copy()
             if "SEX" in clin_adj.columns:
                 clin_adj["SEX"] = clin_adj["SEX"].map({"Male": 1, "Female": 0}).fillna(clin_adj["SEX"])
             clin_adj = clin_adj.astype(float, errors="ignore")
@@ -714,12 +739,8 @@ def main():
             feature_matrix_train.index = pd.Index(train_clinical_ids[:len(feature_matrix_train)])
 
             endpoint_train = pd.DataFrame({
-                "time_months": pd.to_numeric(clinical_adj.set_index("PATIENT_ID").loc[
-                    clinical_adj["PATIENT_ID"].astype(str).isin(train_clinical_ids), time_col
-                ], errors="coerce").to_numpy(dtype=float),
-                "event": clinical_adj.set_index("PATIENT_ID").loc[
-                    clinical_adj["PATIENT_ID"].astype(str).isin(train_clinical_ids), event_col
-                ].astype(int).to_numpy(),
+                "time_months": pd.to_numeric(clin_indexed.loc[train_mask, time_col], errors="coerce").to_numpy(dtype=float),
+                "event": clin_indexed.loc[train_mask, event_col].astype(int).to_numpy(),
             }, index=train_clinical_ids[:len(feature_matrix_train)])
 
             causal_table = run_causal_screening(

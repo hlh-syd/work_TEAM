@@ -318,7 +318,7 @@ def stability_via_subspace_overlap(mats, selected, train_ids, dim, seeds):
 
 def build_survival_gan_conditions(endpoint, index):
     ep = endpoint.reindex(index).copy()
-    death = ep.get("os_death", pd.Series(0.0, index=ep.index)).astype(float)
+    death = ep.get("death_by_36m", ep.get("os_death", pd.Series(0.0, index=ep.index))).astype(float)
     event = ep.get("event", death).astype(float)
     time_months = ep.get("time_months", pd.Series(FIXED_TAU_MONTHS, index=ep.index)).astype(float)
     pseudo = ep.get("pseudo_risk_36m", death).astype(float)
@@ -365,10 +365,14 @@ def fit_clinical_transformer(clinical, split, feature_cols):
     if categorical_cols:
         cat_imputer = SimpleImputer(strategy="constant", fill_value="Unknown")
         encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+        # 修复：impute后强制转为字符串，避免float/str混合类型
         x_train_cat = cat_imputer.fit_transform(raw_x.loc[train_mask, categorical_cols].astype(object))
+        x_train_cat = pd.DataFrame(x_train_cat, columns=categorical_cols).astype(str).values
         encoder.fit(x_train_cat)
         cat_columns = encoder.get_feature_names_out(categorical_cols).tolist()
-        blocks.append(encoder.transform(cat_imputer.transform(raw_x[categorical_cols].astype(object))))
+        x_all_cat = cat_imputer.transform(raw_x[categorical_cols].astype(object))
+        x_all_cat = pd.DataFrame(x_all_cat, columns=categorical_cols).astype(str).values
+        blocks.append(encoder.transform(x_all_cat))
         columns.extend(cat_columns)
         bundle["cat_imputer"] = cat_imputer
         bundle["encoder"] = encoder
@@ -1658,9 +1662,15 @@ def main():
     if os.path.exists(split_path):
         split_df = pd.read_csv(split_path, sep="\t")
         split_df["PATIENT_ID"] = split_df["PATIENT_ID"].astype(str)
-        train_ids = split_df.loc[split_df["split"] == "train", "PATIENT_ID"].tolist()
-        valid_ids = split_df.loc[split_df["split"] != "train", "PATIENT_ID"].tolist()
-        print(f"[03] Predefined split: train={len(train_ids)}, valid={len(valid_ids)}")
+        train_ids_raw = split_df.loc[split_df["split"] == "train", "PATIENT_ID"].tolist()
+        valid_ids_raw = split_df.loc[split_df["split"] != "train", "PATIENT_ID"].tolist()
+        # 交集过滤：只保留在clinical中存在的ID
+        clinical_ids = set(clinical["PATIENT_ID"].astype(str))
+        train_ids = [pid for pid in train_ids_raw if pid in clinical_ids]
+        valid_ids = [pid for pid in valid_ids_raw if pid in clinical_ids]
+        # 更新 split_df 以反映过滤后的ID
+        split_df = split_df[split_df["PATIENT_ID"].isin(train_ids + valid_ids)].copy()
+        print(f"[03] Predefined split: train_raw={len(train_ids_raw)}->filtered={len(train_ids)}, valid_raw={len(valid_ids_raw)}->filtered={len(valid_ids)}")
     else:
         split_df = make_stratified_split(clinical, "OS", 0.25, RANDOM_SEED)
         train_ids = split_df.loc[split_df["split"] == "train", "PATIENT_ID"].tolist()
@@ -1761,6 +1771,15 @@ def main():
         columns={"OS_MONTHS": "time_months", "OS_EVENT": "event"}
     )
     endpoint["event"] = endpoint["event"].astype(int)
+    # 添加 death_by_36m 列（供 GAN 条件采样使用）
+    if "death_by_36m" in clinical.columns:
+        endpoint["death_by_36m"] = clinical.set_index("PATIENT_ID")["death_by_36m"].reindex(endpoint.index)
+    else:
+        endpoint["death_by_36m"] = endpoint["event"].astype(float)
+    # 添加 IPCW/pseudo-risk 列（供 build_survival_gan_conditions 使用）
+    for src, dst in [("pseudo_risk_os", "pseudo_risk_36m"), ("ipcw_weight_os", "ipcw_weight_36m")]:
+        if src in clinical.columns:
+            endpoint[dst] = clinical.set_index("PATIENT_ID")[src].reindex(endpoint.index)
     endpoint_train = endpoint.loc[endpoint.index.isin(train_ids)]
 
     if not skip_gan and HAS_TORCH:
@@ -2055,17 +2074,20 @@ def main():
     if external_results:
         ext_df_plot = pd.DataFrame(external_results)
         ext_pivot = ext_df_plot.pivot_table(index="model", columns="cohort", values="c_index")
-        fig, ax = plt.subplots(figsize=(max(8, ext_pivot.shape[1] * 2), 6))
-        ext_pivot.plot(kind="bar", ax=ax, rot=30, alpha=0.8)
-        ax.set_ylabel("C-index")
-        ax.set_title("External Validation Performance")
-        ax.set_ylim(0, 1)
-        ax.axhline(0.5, color="gray", linestyle="--", alpha=0.5)
-        ax.legend(title="Cohort", bbox_to_anchor=(1.05, 1), loc="upper left")
-        plt.tight_layout()
-        for suffix, dpi in [(".png", 300), (".tiff", 600)]:
-            plt.savefig(os.path.join(fig_dir, "external_validation_cindex" + suffix), dpi=dpi, bbox_inches="tight")
-        plt.close()
+        if not ext_pivot.empty and ext_pivot.notna().any().any():
+            fig, ax = plt.subplots(figsize=(max(8, ext_pivot.shape[1] * 2), 6))
+            ext_pivot.plot(kind="bar", ax=ax, rot=30, alpha=0.8)
+            ax.set_ylabel("C-index")
+            ax.set_title("External Validation Performance")
+            ax.set_ylim(0, 1)
+            ax.axhline(0.5, color="gray", linestyle="--", alpha=0.5)
+            ax.legend(title="Cohort", bbox_to_anchor=(1.05, 1), loc="upper left")
+            plt.tight_layout()
+            for suffix, dpi in [(".png", 300), (".tiff", 600)]:
+                plt.savefig(os.path.join(fig_dir, "external_validation_cindex" + suffix), dpi=dpi, bbox_inches="tight")
+            plt.close()
+        else:
+            print("[03] External validation: no valid C-index results to plot")
 
     if stability:
         fig, ax = plt.subplots(figsize=(8, 4))

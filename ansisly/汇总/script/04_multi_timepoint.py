@@ -269,6 +269,8 @@ def censor_safe_binary_training(endpoint, tau_int):
 
 
 def fit_timepoint_logistic(X_train, endpoint_train, tau_int, random_seed):
+    if X_train.empty or len(X_train) < 10:
+        return None
     y, w = censor_safe_binary_training(endpoint_train, tau_int)
     if y.nunique() < 2 or len(y) < 20:
         return None
@@ -284,11 +286,13 @@ def fit_timepoint_logistic(X_train, endpoint_train, tau_int, random_seed):
 def fit_timepoint_cox(X_train, endpoint_train, penalizer=0.1):
     if CoxPHFitter is None:
         return None
+    if X_train.empty or len(X_train) < 10:
+        return None
     data = X_train.copy()
     data["time_months"] = endpoint_train["time_months"].to_numpy(float)
     data["event"] = endpoint_train["event"].to_numpy(int)
     usable = data.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
-    if usable["event"].sum() < 5:
+    if "event" not in usable.columns or usable["event"].sum() < 5:
         return None
     try:
         model = CoxPHFitter(penalizer=penalizer)
@@ -301,7 +305,7 @@ def fit_timepoint_cox(X_train, endpoint_train, penalizer=0.1):
 def fit_timepoint_coxnet(X_train, endpoint_train):
     if CoxnetSurvivalAnalysis is None or Surv is None:
         return None
-    if endpoint_train["event"].sum() < 5:
+    if X_train.empty or endpoint_train["event"].sum() < 5:
         return None
     y = make_surv_array(endpoint_train)
     try:
@@ -315,7 +319,7 @@ def fit_timepoint_coxnet(X_train, endpoint_train):
 def fit_timepoint_rsf(X_train, endpoint_train, random_seed):
     if RandomSurvivalForest is None or Surv is None:
         return None
-    if endpoint_train["event"].sum() < 5:
+    if X_train.empty or endpoint_train["event"].sum() < 5:
         return None
     y = make_surv_array(endpoint_train)
     try:
@@ -691,12 +695,37 @@ def load_input_data(timestamp):
         split_path = os.path.join(DATA_DIR, "survival_models", "tcga_train_internal_validation_split.tsv")
     clinical = read_tsv(clinical_path)
     split_df = read_tsv(split_path)
-    feature_files = sorted(Path(gene_dir).glob("*.tsv")) if Path(gene_dir).exists() else []
+    # 加载基因表达矩阵（患者×基因）
+    expr_path = os.path.join(preproc_dir, "gene_expression_curated.tsv")
+    if os.path.exists(expr_path):
+        expr_df = read_tsv(expr_path, index_col=0)
+        expr_df = expr_df.apply(pd.to_numeric, errors="coerce")
+    else:
+        expr_df = None
+    # 从 02 加载候选基因列表
+    causal_path = os.path.join(gene_dir, "causal_priority_feature_table.tsv")
+    candidate_genes = []
+    if os.path.exists(causal_path):
+        causal_df = read_tsv(causal_path)
+        if "feature" in causal_df.columns:
+            candidate_genes = causal_df["feature"].tolist()
+    # 构建特征矩阵：候选基因表达子集
     feature_df = None
-    if feature_files:
-        feature_df = read_tsv(feature_files[0], index_col=0)
-    train_ids = set(split_df.loc[split_df["split"] == "train", "PATIENT_ID"].astype(str))
-    val_ids = set(split_df.loc[split_df["split"] == "validation", "PATIENT_ID"].astype(str))
+    if expr_df is not None and candidate_genes:
+        available_genes = [g for g in candidate_genes if g in expr_df.columns]
+        if available_genes:
+            feature_df = expr_df[available_genes].copy()
+            print(f"[04] Feature matrix: {feature_df.shape[0]} samples x {feature_df.shape[1]} candidate genes")
+    if feature_df is None:
+        print("[04] WARNING: No candidate gene expression features available")
+    # 修复 split 匹配：val 为任何非 "train" 的 split
+    train_ids_raw = set(split_df.loc[split_df["split"] == "train", "PATIENT_ID"].astype(str))
+    val_ids_raw = set(split_df.loc[split_df["split"] != "train", "PATIENT_ID"].astype(str))
+    # 交集过滤：只保留在 clinical 中存在的 ID
+    clinical_ids = set(clinical["PATIENT_ID"].astype(str))
+    train_ids = train_ids_raw & clinical_ids
+    val_ids = val_ids_raw & clinical_ids
+    print(f"[04] Split: train_raw={len(train_ids_raw)}->filtered={len(train_ids)}, val_raw={len(val_ids_raw)}->filtered={len(val_ids)}")
     return clinical, feature_df, train_ids, val_ids
 
 
