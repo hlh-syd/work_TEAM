@@ -940,7 +940,7 @@ def main_step05() -> int:
                     })
 
 
-    causal_path = Path(cfg["processed_root"]) / "causal_screening" / "causal_priority_feature_table.tsv"
+    causal_path = Path(cfg["processed_root"]) / "causal" / "causal_priority_feature_table.tsv"
     if causal_path.exists():
         try:
             candidate_genes = [g for g in pd.read_csv(causal_path, sep="\t")["feature"].astype(str).tolist() if not is_likely_pseudogene(g)][:50]
@@ -1224,7 +1224,7 @@ def main_step06() -> int:
     ctx = initialize_run(__file__, args)
     cfg = ctx.cfg
     out_dir = ctx.data_dir("interpretability_biology")
-    causal_path = Path(cfg["processed_root"]) / "causal_screening" / "causal_priority_feature_table.tsv"
+    causal_path = Path(cfg["processed_root"]) / "causal" / "causal_priority_feature_table.tsv"
     coxnet_coef_path = Path(cfg["processed_root"]) / "survival_models" / "coxnet_selected_features_and_coefficients.tsv"
     clinical_coef_path = Path(cfg["processed_root"]) / "survival_models" / "clinical_cox_model_coefficients.tsv"
     rsf_bundle_path = Path(cfg["processed_root"]) / "survival_models" / "serialized_models" / "clinical_random_survival_forest_model_bundle.joblib"
@@ -1467,7 +1467,7 @@ def main_step06() -> int:
     ctx.write_text(out_dir / "mechanistic_hypotheses_for_top_biomarkers.md", "\n".join(text_lines), "analysis_data", "Mechanistic hypothesis notes (proposal only).")
 
     if active_gene_sets is BUNDLED_GENE_SETS:
-        ctx.add_warning("Pathway enrichment used bundled 8-set CRC subset (GMT files not found); re-run after placing MSigDB GMT files in rawData/MSigDB/.")
+        ctx.add_warning("Pathway enrichment used bundled 8-set CRC subset (GMT files not found); re-run after placing MSigDB GMT files in DATA/msigdb/.")
     ctx.finalize([p for p in input_files if p and Path(p).exists()])
     return 0
 
@@ -1476,13 +1476,14 @@ def resolve_multi_timepoint_paths() -> Dict[str, Path]:
 
     script_dir = Path(os.environ.get("MT_SCRIPT_DIR", str(Path(__file__).resolve().parent)))
     data_dir = Path(os.environ.get("MT_DATA_DIR", str(script_dir.parent / "data")))
+    ansisly_data_dir = script_dir.parent.parent / "DATA"  # ansisly/DATA
     output_dir = Path(os.environ.get("MT_OUTPUT_DIR", str(data_dir / "multi_timepoint_results")))
     output_dir.mkdir(parents=True, exist_ok=True)
     return {
-        "clinical": data_dir / "preprocessed" / "tcga_os_clinical_endpoint_qc.tsv",
+        "clinical": ansisly_data_dir / "preprocessed" / "tcga_os_clinical_endpoint_qc.tsv",
         "embedding": data_dir / "multiomics_pretraining" / "tcga_multiomics_patient_embedding.tsv",
         "split": data_dir / "survival_models" / "tcga_train_internal_validation_split.tsv",
-        "causal": data_dir / "causal_screening" / "aipw_causal_screening_table.tsv",
+        "causal": data_dir / "causal" / "aipw_causal_screening_table.tsv",
         "output_dir": output_dir,
         "script_dir": script_dir,
     }

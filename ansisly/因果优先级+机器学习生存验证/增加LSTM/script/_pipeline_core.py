@@ -208,12 +208,13 @@ def project_root() -> Path:
 def default_config() -> dict[str, Any]:
     root = project_root()
     module_data_root = script_root().parent / "data"
-    raw_root = root / "rawData"
+    data_dir = script_root().parent.parent / "DATA"  # ansisly/DATA
+    raw_root = data_dir
     return {
         "project_root": str(root),
         "script_root": str(script_root()),
         "module_data_root": str(module_data_root),
-        "source_data_pool": str(root / "rawData"),
+        "source_data_pool": str(data_dir),
         "raw_root": str(raw_root),
         "processed_root": str(module_data_root),
         "result_root": str(script_root().parent / "results"),
@@ -230,40 +231,50 @@ def default_config() -> dict[str, Any]:
         },
         "cohorts": {
             "tcga": {
-                "clinical_patient": str(raw_root / "coadread_tcga_pan_can_atlas_2018" / "coadread_tcga_pan_can_atlas_2018" / "data_clinical_patient.txt"),
-                "rna": str(raw_root / "coadread_tcga_pan_can_atlas_2018" / "coadread_tcga_pan_can_atlas_2018" / "data_mrna_seq_v2_rsem.txt"),
-                "cnv": str(raw_root / "coadread_tcga_pan_can_atlas_2018" / "coadread_tcga_pan_can_atlas_2018" / "data_log2_cna.txt"),
-                "methylation": str(raw_root / "coadread_tcga_pan_can_atlas_2018" / "coadread_tcga_pan_can_atlas_2018" / "data_methylation_hm450.txt"),
-                "mutation": str(raw_root / "coadread_tcga_pan_can_atlas_2018" / "coadread_tcga_pan_can_atlas_2018" / "data_mutations.txt"),
-                "rppa": str(raw_root / "coadread_tcga_pan_can_atlas_2018" / "coadread_tcga_pan_can_atlas_2018" / "data_rppa.txt"),
+                "clinical_patient": str(raw_root / "tcga" / "data_clinical_patient.txt"),
+                "rna": str(raw_root / "tcga" / "data_mrna_seq_v2_rsem.txt"),
+                "cnv": str(raw_root / "tcga" / "data_cna.txt"),
+                "methylation": str(raw_root / "tcga" / "data_methylation_hm450.txt"),
+                "mutation": str(raw_root / "tcga" / "data_mutations.txt"),
+                "rppa": str(raw_root / "tcga" / "data_rppa.txt"),
             },
             "msk": {
-                "clinical_patient": str(raw_root / "crc_msk_2017" / "crc_msk_2017" / "data_clinical_patient.txt"),
-                "mutation": str(raw_root / "crc_msk_2017" / "crc_msk_2017" / "data_mutations.txt"),
-                "cnv": str(raw_root / "crc_msk_2017" / "crc_msk_2017" / "data_cna.txt"),
+                "clinical_patient": str(raw_root / "external" / "msk_crc_2017_clinical_patient.txt"),
+                "clinical": str(raw_root / "external" / "msk_os_clinical_endpoint_qc.tsv"),
+                "mutation": str(raw_root / "external" / "msk_crc_2017_mutation_gene_level_matrix.tsv"),
+                "cnv": str(raw_root / "external" / "msk_crc_2017_cna_gene_level_matrix.tsv"),
             },
-            "geo_gse103479": {"clinical": str(raw_root / "GEO_COAD" / "GSE103479" / "clinical.txt"), "expression": str(raw_root / "GEO_COAD" / "GSE103479" / "geneMatrix.txt")},
-            "geo_gse17538": {"clinical": str(raw_root / "GEO_COAD" / "GSE17538" / "clinical.txt"), "expression": str(raw_root / "GEO_COAD" / "GSE17538" / "geneMatrix.txt")},
-            "geo_gse39582": {"clinical": str(raw_root / "GEO_COAD" / "GSE39582" / "clinical.txt"), "expression": str(raw_root / "GEO_COAD" / "GSE39582" / "geneMatrix.txt")},
+            "geo_gse103479": {
+                "clinical": str(raw_root / "external" / "geo_gse103479_os_clinical_endpoint_qc.tsv"),
+                "expression": str(raw_root / "external" / "geo_gse103479_expression_matrix.tsv"),
+            },
+            "geo_gse17538": {
+                "clinical": str(raw_root / "external" / "geo_gse17538_os_clinical_endpoint_qc.tsv"),
+                "expression": str(raw_root / "external" / "geo_gse17538_geneMatrix.txt"),
+            },
+            "geo_gse39582": {
+                "clinical": str(raw_root / "external" / "geo_gse39582_os_clinical_endpoint_qc.tsv"),
+                "expression": str(raw_root / "external" / "geo_gse39582_geneMatrix.txt"),
+            },
             "msigdb": {
-                "hallmark": str(raw_root / "MSigDB" / "h.all.v2024.1.Hs.symbols.gmt"),
-                "kegg": str(raw_root / "MSigDB" / "c2.cp.kegg_legacy.v2024.1.Hs.symbols.gmt"),
-                "go_bp": str(raw_root / "MSigDB" / "c5.go.bp.v2024.1.Hs.symbols.gmt"),
+                "hallmark": str(raw_root / "msigdb" / "h.all.v2024.1.Hs.symbols.gmt"),
+                "kegg": str(raw_root / "msigdb" / "c2.cp.kegg_legacy.v2024.1.Hs.symbols.gmt"),
+                "go_bp": str(raw_root / "msigdb" / "c5.go.bp.v2024.1.Hs.symbols.gmt"),
             },
             "cptac": {
-                "clinical_patient": str(raw_root / "coad_cptac_2019" / "coad_cptac_2019" / "data_clinical_patient.txt"),
-                "rna": str(raw_root / "coad_cptac_2019" / "coad_cptac_2019" / "data_mrna_seq_v2_rsem.txt"),
-                "protein": str(raw_root / "coad_cptac_2019" / "coad_cptac_2019" / "data_protein_quantification.txt"),
-                "phosphoprotein": str(raw_root / "coad_cptac_2019" / "coad_cptac_2019" / "data_phosphoprotein_quantification.txt"),
-                "cnv": str(raw_root / "coad_cptac_2019" / "coad_cptac_2019" / "data_log2_cna.txt"),
-                "mutation": str(raw_root / "coad_cptac_2019" / "coad_cptac_2019" / "data_mutations.txt"),
+                "clinical_patient": str(raw_root / "external" / "cptac_os_clinical_endpoint_qc.tsv"),
+                "rna": str(raw_root / "external" / "cptac_coad_rna_gene_level_matrix.tsv"),
+                "protein": str(raw_root / "external" / "cptac_coad_protein_gene_level_matrix.tsv"),
+                "phosphoprotein": str(raw_root / "external" / "cptac_coad_phosphoprotein_gene_level_matrix.tsv"),
+                "cnv": str(raw_root / "external" / "cptac_coad_cnv_gene_level_matrix.tsv"),
+                "mutation": str(raw_root / "external" / "cptac_coad_mutation_gene_level_matrix.tsv"),
             },
             "htan": {
-                "clinical_patient": str(raw_root / "crc_hta8_htan_2024" / "crc_hta8_htan_2024" / "data_clinical_patient.txt"),
-                "pseudo_bulk_rna": str(raw_root / "crc_hta8_htan_2024" / "crc_hta8_htan_2024" / "data_pseudo_bulk_rna_seq_cpm.txt"),
-                "relative_fraction": str(raw_root / "crc_hta8_htan_2024" / "crc_hta8_htan_2024" / "data_relative_fraction.txt"),
-                "cnv": str(raw_root / "crc_hta8_htan_2024" / "crc_hta8_htan_2024" / "data_cna.txt"),
-                "mutation": str(raw_root / "crc_hta8_htan_2024" / "crc_hta8_htan_2024" / "data_mutations.txt"),
+                "clinical_patient": str(raw_root / "external" / "htan_os_clinical_endpoint_qc.tsv"),
+                "pseudo_bulk_rna": str(raw_root / "external" / "htan_crc_pseudobulk_rna_matrix.tsv"),
+                "relative_fraction": str(raw_root / "external" / "htan_crc_microenvironment_relative_fraction_matrix.tsv"),
+                "cnv": str(raw_root / "external" / "htan_crc_cnv_gene_level_matrix.tsv"),
+                "mutation": str(raw_root / "external" / "htan_crc_mutation_gene_level_matrix.tsv"),
             },
         },
     }
@@ -288,12 +299,13 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
         except Exception as exc:
             raise RuntimeError(f"Cannot read config {path}: {exc}") from exc
     module_data_root = (script_root().parent / "data").resolve()
+    _data_dir = (script_root().parent.parent / "DATA").resolve()
     cfg.update({
         "project_root": str(project_root().resolve()),
         "script_root": str(script_root().resolve()),
         "module_data_root": str(module_data_root),
-        "source_data_pool": str((project_root() / "rawData").resolve()),
-        "raw_root": str((project_root() / "rawData").resolve()),
+        "source_data_pool": str(_data_dir),
+        "raw_root": str(_data_dir),
         "processed_root": str(module_data_root),
         "result_root": str((script_root().parent / "results").resolve()),
         "endpoint": "OS",
@@ -317,10 +329,11 @@ def assert_safe_paths(cfg: dict[str, Any]) -> None:
     source_data_pool = resolve_path(cfg["source_data_pool"])
     raw_root = resolve_path(cfg["raw_root"])
     module_data_root = resolve_path(cfg["module_data_root"])
-    if source_data_pool != (project_root() / "rawData").resolve():
-        raise RuntimeError(f"source_data_pool must be the approved project data pool: {project_root() / 'rawData'}")
-    if raw_root != (project_root() / "rawData").resolve():
-        raise RuntimeError(f"raw_root must point to project rawData pool: {project_root() / 'rawData'}")
+    _data_dir = (script_root().parent.parent / "DATA").resolve()
+    if source_data_pool != _data_dir:
+        raise RuntimeError(f"source_data_pool must be the DATA directory: {_data_dir}")
+    if raw_root != _data_dir:
+        raise RuntimeError(f"raw_root must point to DATA directory: {_data_dir}")
 
 
 def assert_safe_write_path(path_like: str | Path, cfg: dict[str, Any]) -> Path:

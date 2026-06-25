@@ -240,7 +240,7 @@ def main_step03() -> int:
             mats[omics_key] = pd.DataFrame()
 
 
-    causal_path = Path(cfg["processed_root"]) / "causal_screening" / "causal_priority_feature_table.tsv"
+    causal_path = Path(cfg["processed_root"]) / "causal" / "causal_priority_feature_table.tsv"
     rna_forced: list[str] = []
     if causal_path.exists():
         try:
@@ -1436,7 +1436,7 @@ def main_step04() -> int:
         ctx.add_warning(f"RSF training failed: {exc}")
 
 
-    causal_table_path = Path(cfg["processed_root"]) / "causal_screening" / "causal_priority_feature_table.tsv"
+    causal_table_path = Path(cfg["processed_root"]) / "causal" / "causal_priority_feature_table.tsv"
     candidate_genes: list[str] = []
     if causal_table_path.exists():
         try:

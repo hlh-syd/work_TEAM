@@ -246,7 +246,7 @@ def main_step02() -> int:
     endpoint = args.endpoint
     filters = cfg.get("filters", {"min_nonmissing_ratio_train": 0.7, "min_events_per_feature": 5, "min_unique_values_per_feature": 3})
     min_nonmissing_ratio = float(filters.get("min_nonmissing_ratio_train", filters.get("min_nonmissing_ratio", 0.7)))
-    causal_dir = ctx.data_dir("causal_screening")
+    causal_dir = ctx.data_dir("causal")
     rna_path = cfg["cohorts"]["tcga"]["rna"]
     clinical_path = cfg["cohorts"]["tcga"]["clinical_patient"]
     split_path = Path(cfg["processed_root"]) / "survival_models" / "tcga_train_internal_validation_split.tsv"

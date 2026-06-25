@@ -284,8 +284,8 @@ def build_external_feature_matrix(
 
     # 仅保留 GEO 芯片表达数据 (已删除 HTAN/CPTAC/GSE103479)
     expr_candidates = {
-        "geo_gse17538": raw_root / "GEO_COAD" / "GSE17538" / "geneMatrix.txt",
-        "geo_gse39582": raw_root / "GEO_COAD" / "GSE39582" / "geneMatrix.txt",
+        "geo_gse17538": raw_root / "external" / "geo_gse17538_geneMatrix.txt",
+        "geo_gse39582": raw_root / "external" / "geo_gse39582_geneMatrix.txt",
     }
     expr_path = None
     for key, path in expr_candidates.items():
@@ -339,7 +339,7 @@ def build_external_feature_matrix(
 
     # 仅保留 MSK 突变数据 (已删除 HTAN/CPTAC)
     mutation_candidates = {
-        "msk": raw_root / "preprocessed" / "msk_crc_2017_mutation_gene_level_matrix.tsv",
+        "msk": raw_root / "external" / "msk_crc_2017_mutation_gene_level_matrix.tsv",
     }
     mut_path = None
     for key, path in mutation_candidates.items():
@@ -466,7 +466,7 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
 
     preprocessed = cfg.raw_data_root / "preprocessed"
     survival_models = cfg.raw_data_root / "survival_models"
-    causal_dir = cfg.raw_data_root / "causal_screening"
+    causal_dir = cfg.raw_data_root / "causal"
     tcga_clin_path = find_existing(
         [
             preprocessed / "tcga_os_clinical_endpoint_qc.tsv",
@@ -993,7 +993,7 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
 def build_arg_parser() -> argparse.ArgumentParser:
     script_path = Path(__file__).resolve()
     project_root = script_path.parents[1]
-    default_raw = Path(r"D:\work-课题\rawData")
+    default_raw = script_path.parents[2] / "DATA"
     parser = argparse.ArgumentParser(description="CRC OS risk prediction pipeline.")
     parser.add_argument("--project-root", type=Path, default=project_root)
     parser.add_argument("--raw-data-root", type=Path, default=default_raw)
