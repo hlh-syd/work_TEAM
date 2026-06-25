@@ -685,6 +685,52 @@ def choose_risk_threshold_unlimited(risk):
     return float(np.nanmedian(valid))
 
 
+def build_clinical_features(clinical_df):
+    """Extract numeric clinical features for model input.
+
+    Includes demographics, staging, molecular markers — same spirit as the
+    individual timepoint scripts (1YearOS.py / 3YearsOS.py etc.).
+    """
+    numeric_candidates = [
+        "AGE", "AGE_AT_DIAGNOSIS", "SEX",
+        "AJCC_PATHOLOGIC_TUMOR_STAGE", "AJCC_STAGE_ENCODED", "AJCC_STAGING_EDITION",
+        "PATH_T_STAGE", "PATH_N_STAGE", "PATH_M_STAGE",
+        "RACE", "RADIATION_THERAPY",
+        "ANEUPLOIDY_SCORE", "TMB_NONSYNONYMOUS",
+        "MSI_SCORE_MANTIS", "MSI_SENSOR_SCORE", "TBL_SCORE",
+        "SOMATIC_STATUS", "NEW_TUMOR_EVENT_AFTER_INITIAL_TREATMENT",
+        "HISTORY_NEOADJUVANT_TRTYN", "PERSON_NEOPLASM_CANCER_STATUS",
+    ]
+    exclude = {
+        "PATIENT_ID", "OS_MONTHS", "OS_EVENT", "OS_STATUS",
+        "DSS_MONTHS", "DSS_STATUS", "PFS_MONTHS", "PFS_STATUS",
+        "DAYS_LAST_FOLLOWUP", "DAYS_TO_BIRTH", "DAYS_TO_INITIAL_PATHOLOGIC_DIAGNOSIS",
+        "death_by_36m_observed", "death_by_36m", "early_censored_before_36m",
+        "ipcw_weight_os", "ipcw_label_available",
+        "pseudo_risk_os_raw", "pseudo_risk_os",
+        "OTHER_PATIENT_ID", "SAMPLE_ID",
+    }
+    work = clinical_df.copy()
+    work["PATIENT_ID"] = work["PATIENT_ID"].astype(str)
+    feat_cols = []
+    for col in numeric_candidates:
+        if col in work.columns and col not in exclude:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+            if work[col].notna().sum() > len(work) * 0.3:
+                feat_cols.append(col)
+    # Add any additional numeric columns not already captured
+    for col in work.columns:
+        if col not in exclude and col not in feat_cols:
+            numeric_series = pd.to_numeric(work[col], errors="coerce")
+            if numeric_series.notna().sum() > len(work) * 0.5 and numeric_series.nunique() > 1:
+                work[col] = numeric_series
+                feat_cols.append(col)
+    if not feat_cols:
+        return pd.DataFrame(index=work["PATIENT_ID"].values)
+    clinical_features = work.set_index("PATIENT_ID")[feat_cols].copy()
+    return clinical_features
+
+
 def load_input_data(timestamp):
     results_base = os.path.join(RESULTS_DIR, timestamp)
     preproc_dir = os.path.join(results_base, "01_preprocessing")
@@ -709,15 +755,23 @@ def load_input_data(timestamp):
         causal_df = read_tsv(causal_path)
         if "feature" in causal_df.columns:
             candidate_genes = causal_df["feature"].tolist()
-    # 构建特征矩阵：候选基因表达子集
+    # 构建特征矩阵：临床特征 + 候选基因表达子集（与旧脚本1/2/3/UnlimitedOS.py保持一致）
+    clinical_features = build_clinical_features(clinical)
+    print(f"[04] Clinical features: {clinical_features.shape[1]} columns: {list(clinical_features.columns)}")
     feature_df = None
     if expr_df is not None and candidate_genes:
         available_genes = [g for g in candidate_genes if g in expr_df.columns]
         if available_genes:
-            feature_df = expr_df[available_genes].copy()
-            print(f"[04] Feature matrix: {feature_df.shape[0]} samples x {feature_df.shape[1]} candidate genes")
+            expr_subset = expr_df[available_genes].copy()
+            # 合并临床特征 + 基因表达特征
+            combined = pd.concat([clinical_features, expr_subset], axis=1)
+            feature_df = combined
+            print(f"[04] Feature matrix (clinical+expression): {feature_df.shape[0]} samples x {feature_df.shape[1]} features "
+                  f"({clinical_features.shape[1]} clinical + {len(available_genes)} genes)")
     if feature_df is None:
-        print("[04] WARNING: No candidate gene expression features available")
+        # 仅有临床特征作为 fallback
+        feature_df = clinical_features
+        print(f"[04] WARNING: No gene expression features; using clinical features only: {feature_df.shape}")
     # 修复 split 匹配：val 为任何非 "train" 的 split
     train_ids_raw = set(split_df.loc[split_df["split"] == "train", "PATIENT_ID"].astype(str))
     val_ids_raw = set(split_df.loc[split_df["split"] != "train", "PATIENT_ID"].astype(str))

@@ -1958,88 +1958,9 @@ def main():
     if risk_dist_data:
         plot_risk_distribution(risk_dist_data, "tcga_internal", fig_dir)
 
-    print("[03] Step 5: External validation...")
-    external_cohorts = {
-        "msk": os.path.join(DATA_DIR, "external", "msk_os_clinical_endpoint_qc.tsv"),
-        "geo_gse17538": os.path.join(DATA_DIR, "external", "geo_gse17538_os_clinical_endpoint_qc.tsv"),
-        "geo_gse39582": os.path.join(DATA_DIR, "external", "geo_gse39582_os_clinical_endpoint_qc.tsv"),
-        "cptac": os.path.join(DATA_DIR, "external", "cptac_os_clinical_endpoint_qc.tsv"),
-        "htan": os.path.join(DATA_DIR, "external", "htan_os_clinical_endpoint_qc.tsv"),
-    }
-
+    print("[03] Step 5: External validation skipped (internal validation only mode).")
+    external_cohorts = {}
     external_results = []
-    for cohort_name, cohort_path in external_cohorts.items():
-        if not os.path.exists(cohort_path):
-            print(f"[03] External cohort {cohort_name}: file not found, skipping")
-            continue
-        try:
-            ext_df = pd.read_csv(cohort_path, sep="\t", low_memory=False)
-            try:
-                ext_df = normalize_external_clinical(ext_df, cohort_name)
-            except Exception:
-                pass
-            ext_df["PATIENT_ID"] = ext_df["PATIENT_ID"].astype(str)
-            ext_time_col = next((c for c in ["OS_MONTHS", "time_months"] if c in ext_df.columns), None)
-            ext_event_col = next((c for c in ["OS_EVENT", "event", "OS_STATUS_BINARY"] if c in ext_df.columns), None)
-            if ext_time_col is None or ext_event_col is None:
-                continue
-            ext_df["time_months"] = pd.to_numeric(ext_df[ext_time_col], errors="coerce")
-            ext_df["event"] = ext_df[ext_event_col].fillna(False).astype(bool).astype(int)
-            ext_df = ext_df.loc[ext_df["time_months"].notna() & (ext_df["time_months"] > 0)].copy()
-
-            if clin_bundle and clin_features:
-                try:
-                    X_ext = transform_clinical_external(ext_df, "PATIENT_ID", {"transformer": clin_bundle})
-                except Exception:
-                    X_ext = pd.DataFrame(index=ext_df["PATIENT_ID"].values)
-            else:
-                X_ext = pd.DataFrame(index=ext_df["PATIENT_ID"].values)
-
-            for model_name, model in trained_models.items():
-                try:
-                    if model_name == "cox_ph":
-                        cols = [c for c in model.params_.index if c in X_ext.columns]
-                        if not cols:
-                            continue
-                        Xe = X_ext.reindex(columns=cols, fill_value=0)
-                        risk_ext = np.asarray(model.predict_partial_hazard(Xe), dtype=float).ravel()
-                    elif model_name in ("coxnet", "rsf"):
-                        risk_ext = np.asarray(model.predict(X_ext.values.astype(float)), dtype=float)
-                    elif model_name == "logistic":
-                        risk_ext = model.predict_proba(X_ext.values.astype(float))[:, 1]
-                    else:
-                        continue
-                    c_ext = harrell_c_index(ext_df["time_months"].values, ext_df["event"].values, risk_ext)
-                    external_results.append({
-                        "cohort": cohort_name, "model": model_name,
-                        "c_index": c_ext, "n_patients": len(ext_df),
-                        "n_events": int(ext_df["event"].sum()),
-                    })
-                    print(f"[03] {cohort_name}/{model_name}: C-index={c_ext:.4f} (n={len(ext_df)})")
-                    try:
-                        ext_time = ext_df["time_months"].values.astype(float)
-                        ext_event = ext_df["event"].values.astype(int)
-                        plot_calibration_curve(ext_time, ext_event, risk_ext, cohort_name, model_name, fig_dir)
-                        plot_km_risk_strata(ext_time, ext_event, risk_ext, cohort_name, model_name, fig_dir)
-                        dca_thr_ext = np.arange(0.05, 0.51, 0.01)
-                        dca_ext_df = decision_curve_analysis(ext_time, ext_event, risk_ext, horizon_months=60.0, thresholds=dca_thr_ext)
-                        if not dca_ext_df.empty:
-                            plot_dca(dca_ext_df, cohort_name, model_name, fig_dir)
-                    except Exception:
-                        pass
-                except Exception as e:
-                    print(f"[03] {cohort_name}/{model_name} failed: {e}")
-                    external_results.append({
-                        "cohort": cohort_name, "model": model_name,
-                        "c_index": float("nan"), "n_patients": len(ext_df),
-                        "n_events": int(ext_df["event"].sum()), "error": str(e),
-                    })
-        except Exception as e:
-            print(f"[03] External cohort {cohort_name} loading failed: {e}")
-
-    if external_results:
-        ext_eval_df = pd.DataFrame(external_results)
-        ext_eval_df.to_csv(os.path.join(eval_dir, "external_real_world_validation_metrics.tsv"), sep="\t", index=False)
 
     all_bundles = {}
     for mn, mb in model_bundles.items():
@@ -2071,23 +1992,7 @@ def main():
             plt.savefig(os.path.join(fig_dir, "internal_validation_cindex" + suffix), dpi=dpi, bbox_inches="tight")
         plt.close()
 
-    if external_results:
-        ext_df_plot = pd.DataFrame(external_results)
-        ext_pivot = ext_df_plot.pivot_table(index="model", columns="cohort", values="c_index")
-        if not ext_pivot.empty and ext_pivot.notna().any().any():
-            fig, ax = plt.subplots(figsize=(max(8, ext_pivot.shape[1] * 2), 6))
-            ext_pivot.plot(kind="bar", ax=ax, rot=30, alpha=0.8)
-            ax.set_ylabel("C-index")
-            ax.set_title("External Validation Performance")
-            ax.set_ylim(0, 1)
-            ax.axhline(0.5, color="gray", linestyle="--", alpha=0.5)
-            ax.legend(title="Cohort", bbox_to_anchor=(1.05, 1), loc="upper left")
-            plt.tight_layout()
-            for suffix, dpi in [(".png", 300), (".tiff", 600)]:
-                plt.savefig(os.path.join(fig_dir, "external_validation_cindex" + suffix), dpi=dpi, bbox_inches="tight")
-            plt.close()
-        else:
-            print("[03] External validation: no valid C-index results to plot")
+    # External validation plotting skipped (internal validation only mode)
 
     if stability:
         fig, ax = plt.subplots(figsize=(8, 4))
@@ -2134,7 +2039,8 @@ def main():
         "internal_validation_used_for_gan_selection": False,
         "internal_validation_used_for_threshold_selection": False,
         "internal_validation_used_for_hyperparameter_search": False,
-        "external_cohorts_used_post_lock_only": True,
+        "external_cohorts_used_post_lock_only": False,
+        "external_validation": "skipped_internal_only_mode",
         "feature_selection_scope": "train_split_only",
         "split_source": str(split_path),
         "n_train": int(train_mask.sum()),
@@ -2149,11 +2055,8 @@ def main():
         "model_selection_policy": "survival_composite",
         "selection_rationale": selection_rationale,
         "models_trained": list(trained_models.keys()),
-        "external_validation_models": {},
+        "external_validation": "skipped",
     }
-    for mn, mb in model_bundles.items():
-        fname = f"{mn}_bundle.pkl"
-        manifest["external_validation_models"][mn] = fname
     with open(os.path.join(eval_dir, "selected_primary_model_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 
@@ -2169,7 +2072,8 @@ def main():
         "models_trained": list(trained_models.keys()),
         "best_model": best_model_name,
         "best_c_index": eval_results.get(best_model_name, {}).get("c_index") if best_model_name else None,
-        "external_cohorts_evaluated": list(set(r["cohort"] for r in external_results)) if external_results else [],
+        "external_cohorts_evaluated": [],
+        "external_validation": "skipped_internal_only_mode",
         "selection_rationale": selection_rationale,
     }
     with open(os.path.join(eval_dir, "model_training_summary.json"), "w") as f:
