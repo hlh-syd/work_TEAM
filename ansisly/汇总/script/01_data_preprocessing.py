@@ -17,139 +17,28 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 import polars as pl
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "DATA"))
-RESULTS_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "results"))
+from shared_utils import (
+    setup_logger,
+    SCRIPT_DIR, DATA_DIR, RESULTS_DIR,
+    FIXED_TAU_MONTHS, EPS, DAYS_PER_MONTH, MAX_N_EXACT_PSEUDO, META_COLUMNS,
+    patient_id_from_sample, normalize_patient_id,
+    parse_survival_status, numeric_series, encode_ajcc_stage,
+    kaplan_meier_survival_at, km_cumulative_incidence_by_tau,
+)
+logger = setup_logger("01_preprocessing")
+
 
 TCGA_DIR = os.path.join(DATA_DIR, "tcga")
 PREPROCESSED_DIR = os.path.join(DATA_DIR, "preprocessed")
 
-FIXED_TAU_MONTHS = 36.0
-EPS = 1e-8
 TOP_K_GENES = 300
 MUTATION_FREQ_LOW = 0.02
 MUTATION_FREQ_HIGH = 0.80
 MISSING_COL_THRESHOLD = 0.40
-DAYS_PER_MONTH = 30.44
-MAX_N_EXACT_PSEUDO = 1200
-
-META_COLUMNS = {
-    "Hugo_Symbol", "Entrez_Gene_Id", "Cytoband",
-    "Composite.Element.REF", "ENTITY_STABLE_ID", "NAME",
-    "DESCRIPTION", "TRANSCRIPT_ID", "ID", "GENE_SYMBOL",
-    "PHOSPHOSITE", "geneNames",
-}
-
-STAGE_MAP = {
-    "STAGE I": 1, "STAGE IA": 1, "STAGE IB": 1,
-    "STAGE II": 2, "STAGE IIA": 2, "STAGE IIB": 2, "STAGE IIC": 2,
-    "STAGE III": 3, "STAGE IIIA": 3, "STAGE IIIB": 3, "STAGE IIIC": 3,
-    "STAGE IV": 4, "STAGE IVA": 4, "STAGE IVB": 4, "STAGE IVC": 4,
-    "STAGE 0": 0,
-    "I": 1, "IA": 1, "IB": 1,
-    "II": 2, "IIA": 2, "IIB": 2, "IIC": 2,
-    "III": 3, "IIIA": 3, "IIIB": 3, "IIIC": 3,
-    "IV": 4, "IVA": 4, "IVB": 4, "IVC": 4,
-    "0": 0,
-}
-
-
-def patient_id_from_sample(value):
-    text = str(value)
-    if text.startswith("TCGA-") and len(text) >= 12:
-        return text[:12]
-    if text.startswith("HTA8_"):
-        parts = text.split("_")
-        if len(parts) >= 2:
-            return "_".join(parts[:2])
-    return text
-
-
-def normalize_patient_id(value):
-    text = str(value).strip()
-    if not text or text.lower() == "nan":
-        return ""
-    if text.upper().startswith("TCGA-") and len(text) >= 12:
-        return text[:12].upper()
-    return re.sub(r"[\s_]+", "-", text).upper()
-
-
-def parse_survival_status(series):
-    values = series.fillna("").astype(str).str.strip()
-    lower = values.str.lower()
-    event = (
-        values.str.startswith("1")
-        | lower.isin({"1", "dead", "deceased", "event", "progression",
-                       "recurred/progressed", "1:deceased", "yes", "true"})
-    )
-    censored = lower.isin({"0", "alive", "living", "0:living", "no", "false", "censored"})
-    result = pd.Series(np.nan, index=series.index)
-    result[event] = 1.0
-    result[censored] = 0.0
-    numeric = pd.to_numeric(series, errors="coerce")
-    result = result.where(result.notna(), numeric)
-    return result
-
-
-def numeric_series(series):
-    return pd.to_numeric(
-        series.replace({"[Not Available]": None, "": None, "NA": None, "NaN": None}),
-        errors="coerce",
-    )
-
-
-def kaplan_meier_survival_at(times, event_observed, query):
-    order = np.argsort(times)
-    times_sorted = np.asarray(times, dtype=float)[order]
-    events_sorted = np.asarray(event_observed, dtype=int)[order]
-    unique_event_times = np.unique(times_sorted[events_sorted == 1])
-    surv = 1.0
-    surv_times = []
-    surv_values = []
-    for t in unique_event_times:
-        at_risk = np.sum(times_sorted >= t)
-        d = np.sum((times_sorted == t) & (events_sorted == 1))
-        if at_risk > 0:
-            surv *= max(0.0, 1.0 - d / at_risk)
-        surv_times.append(float(t))
-        surv_values.append(float(surv))
-    if not surv_times:
-        return np.ones(len(query), dtype=float)
-    surv_times_arr = np.asarray(surv_times)
-    surv_values_arr = np.asarray(surv_values)
-    idx = np.searchsorted(surv_times_arr, query, side="right") - 1
-    out = np.ones(len(query), dtype=float)
-    mask = idx >= 0
-    out[mask] = surv_values_arr[idx[mask]]
-    return np.clip(out, EPS, 1.0)
-
-
-def km_cumulative_incidence_by_tau(times, events, tau):
-    surv = kaplan_meier_survival_at(times, events, np.asarray([tau], dtype=float))[0]
-    return float(1.0 - surv)
 
 
 def matrix_sample_columns(columns):
     return [c for c in columns if c not in META_COLUMNS]
-
-
-def encode_ajcc_stage(series):
-    def _map(val):
-        if pd.isna(val):
-            return np.nan
-        text = str(val).strip().upper()
-        if text in STAGE_MAP:
-            return STAGE_MAP[text]
-        cleaned = re.sub(r"[^A-Z0-9]", "", text)
-        if cleaned in STAGE_MAP:
-            return STAGE_MAP[cleaned]
-        match = re.search(r"(\d+|[IVX]+)", text)
-        if match:
-            token = match.group(1)
-            if token in STAGE_MAP:
-                return STAGE_MAP[token]
-        return np.nan
-    return series.apply(_map)
 
 
 def load_clinical_data():
@@ -414,7 +303,7 @@ def load_methylation(probe_blacklist=None, min_iqr=0.0):
     if not os.path.exists(meth_path):
         raise FileNotFoundError(f"甲基化数据文件不存在: {meth_path}")
 
-    print("  [提示] 甲基化文件较大(~1.3GB)，使用 Polars+numpy 优化加载...")
+    logger.info("  [提示] 甲基化文件较大(~1.3GB)，使用 Polars+numpy 优化加载...")
     _t0 = _time.time()
 
     # ── Step 1: Polars 读取 ──────────────────────────────────────────
@@ -438,7 +327,7 @@ def load_methylation(probe_blacklist=None, min_iqr=0.0):
         df = df.filter(~pl.col(first_col).cast(pl.Utf8).str.starts_with("#"))
 
     _t1 = _time.time()
-    print(f"  Polars 读取完成: {_t1 - _t0:.1f}s, shape={df.shape}")
+    logger.info(f"  Polars 读取完成: {_t1 - _t0:.1f}s, shape={df.shape}")
 
     # ── Step 1b: 确定 ID 列和 sample 列 ─────────────────────────────
     id_col = df.columns[0]
@@ -461,7 +350,7 @@ def load_methylation(probe_blacklist=None, min_iqr=0.0):
         df = df.filter(~pl.col(id_col).is_in(blacklist_list))
 
     _t2 = _time.time()
-    print(f"  列选择/类型转换完成: {_t2 - _t1:.1f}s")
+    logger.info(f"  列选择/类型转换完成: {_t2 - _t1:.1f}s")
 
     # ── Step 2: 转 numpy 并处理重复探针 ─────────────────────────────
     probe_ids = df[id_col].to_list()
@@ -472,7 +361,7 @@ def load_methylation(probe_blacklist=None, min_iqr=0.0):
     probe_ids_arr = np.array(probe_ids)
     unique_probes, inverse_idx = np.unique(probe_ids_arr, return_inverse=True)
     if len(unique_probes) < len(probe_ids_arr):
-        print(f"  发现重复探针: {len(probe_ids_arr)} -> {len(unique_probes)}，执行聚合...")
+        logger.info(f"  发现重复探针: {len(probe_ids_arr)} -> {len(unique_probes)}，执行聚合...")
         n_samples = values.shape[1]
         agg_values = np.zeros((len(unique_probes), n_samples), dtype=np.float32)
         agg_counts = np.zeros((len(unique_probes), n_samples), dtype=np.float32)
@@ -497,7 +386,7 @@ def load_methylation(probe_blacklist=None, min_iqr=0.0):
     unique_patients, patient_inverse = np.unique(patient_ids_arr, return_inverse=True)
 
     if len(unique_patients) < len(patient_ids_raw):
-        print(f"  发现重复 patient_id: {len(patient_ids_raw)} -> {len(unique_patients)}，执行聚合...")
+        logger.info(f"  发现重复 patient_id: {len(patient_ids_raw)} -> {len(unique_patients)}，执行聚合...")
         n_probes = transposed.shape[1]
         agg_transposed = np.zeros((len(unique_patients), n_probes), dtype=np.float32)
         agg_pat_counts = np.zeros((len(unique_patients), n_probes), dtype=np.float32)
@@ -515,7 +404,7 @@ def load_methylation(probe_blacklist=None, min_iqr=0.0):
     del transposed
 
     _t3 = _time.time()
-    print(f"  转置/聚合完成: {_t3 - _t2:.1f}s, shape={matrix.shape}")
+    logger.info(f"  转置/聚合完成: {_t3 - _t2:.1f}s, shape={matrix.shape}")
 
     # 移除全 NaN 的探针列
     col_not_all_nan = ~np.all(np.isnan(matrix), axis=0)
@@ -523,7 +412,7 @@ def load_methylation(probe_blacklist=None, min_iqr=0.0):
         n_removed = int(np.sum(~col_not_all_nan))
         matrix = matrix[:, col_not_all_nan]
         probe_ids = [p for p, k in zip(probe_ids, col_not_all_nan) if k]
-        print(f"  移除全NaN探针列: {n_removed} 个")
+        logger.info(f"  移除全NaN探针列: {n_removed} 个")
     del col_not_all_nan
 
     # ── Step 4: 低变异过滤（可选） ───────────────────────────────────
@@ -535,7 +424,7 @@ def load_methylation(probe_blacklist=None, min_iqr=0.0):
         n_before = matrix.shape[1]
         matrix = matrix[:, keep_mask]
         probe_ids = [p for p, k in zip(probe_ids, keep_mask) if k]
-        print(f"  低变异过滤(IQR>={min_iqr}): {n_before} -> {matrix.shape[1]} 探针")
+        logger.info(f"  低变异过滤(IQR>={min_iqr}): {n_before} -> {matrix.shape[1]} 探针")
         del q75, q25, iqr, keep_mask
 
     # ── Step 5: numpy 层缺失值填充 ───────────────────────────────────
@@ -551,7 +440,7 @@ def load_methylation(probe_blacklist=None, min_iqr=0.0):
     if nan_mask.any():
         matrix = np.where(nan_mask, medians, matrix)
         n_filled = int(nan_mask.sum())
-        print(f"  缺失值填充: {n_filled} 个值")
+        logger.info(f"  缺失值填充: {n_filled} 个值")
     del medians, nan_mask, nan_medians
 
     # ── Step 6: numpy 层标准化 ───────────────────────────────────────
@@ -565,7 +454,7 @@ def load_methylation(probe_blacklist=None, min_iqr=0.0):
     del matrix
 
     _t_end = _time.time()
-    print(f"  甲基化加载总耗时: {_t_end - _t0:.1f}s, 最终shape={patient_matrix.shape}")
+    logger.info(f"  甲基化加载总耗时: {_t_end - _t0:.1f}s, 最终shape={patient_matrix.shape}")
 
     return patient_matrix
 
@@ -603,7 +492,14 @@ def load_rppa():
     return patient_matrix
 
 
-def align_samples(clinical_df, gene_df, mutation_df, cnv_df, methylation_df, rppa_df):
+def align_samples(clinical_df, gene_df, mutation_df, cnv_df, methylation_df, rppa_df, strict=False):
+    """多组学样本对齐。
+
+    Args:
+        strict: 若 True，取所有组学严格交集（保守）；
+                若 False（默认），取核心组学（临床+RNA+突变）交集，
+                其他组学允许部分缺失，由下游 mask 机制处理。
+    """
     clinical_ids = set(clinical_df["PATIENT_ID"].astype(str))
 
     omics_sets = {}
@@ -619,8 +515,18 @@ def align_samples(clinical_df, gene_df, mutation_df, cnv_df, methylation_df, rpp
     if rppa_df is not None and not rppa_df.empty:
         omics_sets["rppa"] = set(rppa_df.index.astype(str))
 
-    all_sets = [clinical_ids] + list(omics_sets.values())
-    common_ids = set.intersection(*all_sets) if all_sets else set()
+    if strict:
+        # 严格交集：所有组学都必须有数据
+        all_sets = [clinical_ids] + list(omics_sets.values())
+        common_ids = set.intersection(*all_sets) if all_sets else set()
+    else:
+        # 核心交集：临床 + RNA + 突变（这三个是核心组学）
+        core_sets = [clinical_ids]
+        if "gene" in omics_sets:
+            core_sets.append(omics_sets["gene"])
+        if "mutation" in omics_sets:
+            core_sets.append(omics_sets["mutation"])
+        common_ids = set.intersection(*core_sets) if core_sets else set()
 
     if not common_ids:
         available_sets = [clinical_ids]
@@ -630,6 +536,12 @@ def align_samples(clinical_df, gene_df, mutation_df, cnv_df, methylation_df, rpp
         common_ids = set.intersection(*available_sets) if available_sets else set()
 
     common_ids = sorted(common_ids)
+
+    logger.info(f"  [对齐策略] {'严格交集' if strict else '核心交集(临床+RNA+突变)'}: {len(common_ids)} 样本")
+    if not strict:
+        for name, s in omics_sets.items():
+            overlap = len(set(common_ids) & s) if s else 0
+            logger.info(f"    {name}: {overlap}/{len(common_ids)} 样本有数据 ({overlap/max(1,len(common_ids))*100:.1f}%)")
 
     clinical_aligned = clinical_df[clinical_df["PATIENT_ID"].astype(str).isin(common_ids)].copy()
 
@@ -676,7 +588,7 @@ def save_preprocessed(output_dir, clinical_df, gene_df, gene_names, mutation_df,
         try:
             methylation_df.to_parquet(os.path.join(output_dir, "methylation_curated.parquet"), engine="pyarrow")
         except Exception as e:
-            print(f"  [WARNING] Parquet缓存保存失败: {e}")
+            logger.warning(f"  [WARNING] Parquet缓存保存失败: {e}")
 
     if rppa_df is not None and not rppa_df.empty:
         rppa_df.to_csv(os.path.join(output_dir, "rppa_curated.tsv"), sep="\t")
@@ -720,22 +632,22 @@ def main():
     timestamp = args.timestamp if args.timestamp else datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(RESULTS_DIR, timestamp, "01_preprocessing")
 
-    print(f"[01_preprocessing] 开始预处理 | 时间戳: {timestamp}")
-    print(f"[01_preprocessing] 数据目录: {DATA_DIR}")
-    print(f"[01_preprocessing] TCGA目录: {TCGA_DIR}")
-    print(f"[01_preprocessing] 输出目录: {output_dir}")
+    logger.info(f"[01_preprocessing] 开始预处理 | 时间戳: {timestamp}")
+    logger.info(f"[01_preprocessing] 数据目录: {DATA_DIR}")
+    logger.info(f"[01_preprocessing] TCGA目录: {TCGA_DIR}")
+    logger.info(f"[01_preprocessing] 输出目录: {output_dir}")
 
     if not os.path.isdir(TCGA_DIR):
-        print(f"[ERROR] TCGA数据目录不存在: {TCGA_DIR}", file=sys.stderr)
+        logger.error(f"[ERROR] TCGA数据目录不存在: {TCGA_DIR}")
         sys.exit(1)
 
-    print("[STEP 1/8] 加载临床数据...")
+    logger.info("[STEP 1/8] 加载临床数据...")
     clinical_df, le_dict = load_clinical_data()
-    print(f"  临床数据: {clinical_df.shape[0]} 患者, {clinical_df.shape[1]} 列")
+    logger.info(f"  临床数据: {clinical_df.shape[0]} 患者, {clinical_df.shape[1]} 列")
 
-    print("[STEP 2/8] 处理生存终点...")
+    logger.info("[STEP 2/8] 处理生存终点...")
     clinical_df = process_survival_endpoints(clinical_df)
-    print(f"  生存终点处理后: {clinical_df.shape[0]} 患者")
+    logger.info(f"  生存终点处理后: {clinical_df.shape[0]} 患者")
 
     gene_df = None
     gene_names = []
@@ -744,47 +656,47 @@ def main():
     methylation_df = None
     rppa_df = None
 
-    print("[STEP 3/8] 加载基因表达数据...")
+    logger.info("[STEP 3/8] 加载基因表达数据...")
     try:
         gene_df, gene_names = load_gene_expression()
-        print(f"  基因表达: {gene_df.shape[0]} 患者 x {gene_df.shape[1]} 基因")
+        logger.info(f"  基因表达: {gene_df.shape[0]} 患者 x {gene_df.shape[1]} 基因")
     except (FileNotFoundError, ValueError) as e:
-        print(f"  [WARNING] {e}")
+        logger.warning(f"  [WARNING] {e}")
 
-    print("[STEP 4/8] 加载突变数据...")
+    logger.info("[STEP 4/8] 加载突变数据...")
     try:
         mutation_df = load_mutation_matrix()
         if mutation_df is not None and not mutation_df.empty:
-            print(f"  突变矩阵: {mutation_df.shape[0]} 患者 x {mutation_df.shape[1] - 1} 基因")
+            logger.info(f"  突变矩阵: {mutation_df.shape[0]} 患者 x {mutation_df.shape[1] - 1} 基因")
     except (FileNotFoundError, ValueError) as e:
-        print(f"  [WARNING] {e}")
+        logger.warning(f"  [WARNING] {e}")
 
-    print("[STEP 5/8] 加载CNV数据...")
+    logger.info("[STEP 5/8] 加载CNV数据...")
     try:
         cnv_df = load_cnv()
-        print(f"  CNV: {cnv_df.shape[0]} 患者 x {cnv_df.shape[1]} 特征")
+        logger.info(f"  CNV: {cnv_df.shape[0]} 患者 x {cnv_df.shape[1]} 特征")
     except (FileNotFoundError, ValueError) as e:
-        print(f"  [WARNING] {e}")
+        logger.warning(f"  [WARNING] {e}")
 
-    print("[STEP 6/8] 加载甲基化数据...")
+    logger.info("[STEP 6/8] 加载甲基化数据...")
     try:
         methylation_df = load_methylation()
-        print(f"  甲基化: {methylation_df.shape[0]} 患者 x {methylation_df.shape[1]} 特征")
+        logger.info(f"  甲基化: {methylation_df.shape[0]} 患者 x {methylation_df.shape[1]} 特征")
     except (FileNotFoundError, ValueError) as e:
-        print(f"  [WARNING] {e}")
+        logger.warning(f"  [WARNING] {e}")
 
-    print("[STEP 7/8] 加载RPPA数据...")
+    logger.info("[STEP 7/8] 加载RPPA数据...")
     try:
         rppa_df = load_rppa()
-        print(f"  RPPA: {rppa_df.shape[0]} 患者 x {rppa_df.shape[1]} 特征")
+        logger.info(f"  RPPA: {rppa_df.shape[0]} 患者 x {rppa_df.shape[1]} 特征")
     except (FileNotFoundError, ValueError) as e:
-        print(f"  [WARNING] {e}")
+        logger.warning(f"  [WARNING] {e}")
 
-    print("[STEP 8/8] 对齐样本并保存...")
+    logger.info("[STEP 8/8] 对齐样本并保存...")
     sample_ids, clinical_aligned, gene_aligned, mutation_aligned, cnv_aligned, methylation_aligned, rppa_aligned = align_samples(
         clinical_df, gene_df, mutation_df, cnv_df, methylation_df, rppa_df
     )
-    print(f"  对齐后样本数: {len(sample_ids)}")
+    logger.info(f"  对齐后样本数: {len(sample_ids)}")
 
     config = {
         "timestamp": timestamp,
@@ -803,7 +715,7 @@ def main():
         sample_ids, config,
     )
 
-    print(f"[01_preprocessing] 完成! 结果保存到: {output_dir}")
+    logger.info(f"[01_preprocessing] 完成! 结果保存到: {output_dir}")
 
 
 if __name__ == "__main__":

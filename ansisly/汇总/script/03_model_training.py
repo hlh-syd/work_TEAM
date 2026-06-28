@@ -13,7 +13,6 @@ import joblib
 import numpy as np
 import pandas as pd
 from scipy import stats
-from scipy.stats import rankdata
 from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegressionCV
@@ -36,12 +35,13 @@ except Exception:
     concordance_index = None
 
 try:
-    from sksurv.ensemble import RandomSurvivalForest
+    from sksurv.ensemble import RandomSurvivalForest, GradientBoostingSurvivalAnalysis
     from sksurv.linear_model import CoxnetSurvivalAnalysis
     from sksurv.metrics import concordance_index_censored, concordance_index_ipcw, cumulative_dynamic_auc, brier_score, integrated_brier_score
     from sksurv.util import Surv
 except Exception:
     RandomSurvivalForest = None
+    GradientBoostingSurvivalAnalysis = None
     CoxnetSurvivalAnalysis = None
     concordance_index_censored = None
     concordance_index_ipcw = None
@@ -51,6 +51,13 @@ except Exception:
     Surv = None
 
 try:
+    import xgboost as xgb
+    HAS_XGBOOST = True
+except Exception:
+    xgb = None
+    HAS_XGBOOST = False
+
+try:
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, TensorDataset
@@ -58,14 +65,21 @@ try:
 except Exception:
     HAS_TORCH = False
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "DATA"))
-RESULTS_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "results"))
+from shared_utils import (
+    setup_logger,
+    SCRIPT_DIR, DATA_DIR, RESULTS_DIR,
+    FIXED_TAU_MONTHS, EPS, RANDOM_SEED, RANDOM_SEED_GAN,
+    STAGE_MAP_GROUP as STAGE_MAP, META_COLUMNS,
+    parse_survival_status, numeric_series, stage_to_group,
+    rank_inverse_normal, stratified_split_keys, sanitize_filename,
+    make_surv_array, safe_read_tsv, patient_id_from_sample,
+    add_fixed_endpoint, compute_ipcw_weights, compute_pseudo_observations,
+    normalize_patient_id, detect_event_time_columns, coerce_event,
+)
+logger = setup_logger("03_model_training")
 
-FIXED_TAU_MONTHS = 36.0
-EPS = 1e-8
-RANDOM_SEED = 42
-RANDOM_SEED_GAN = 1337
+
+read_tsv_safe = safe_read_tsv  # backward compatibility alias
 
 SURVIVAL_GAN_CONDITION_COLUMNS = [
     "death_by_36m", "event", "log1p_time_months",
@@ -76,24 +90,13 @@ GAN_AUG_RATIO_CANDIDATES = (0.25, 0.5, 1.0, 2.0)
 GAN_SAMPLING_STRATEGIES = ("balanced_event", "risk_stratified", "event_only", "overall")
 GAN_MIN_AUC_GAIN = 0.005
 
-STAGE_MAP = {
-    "STAGE I": "I", "STAGE IA": "I", "STAGE IB": "I",
-    "STAGE II": "II", "STAGE IIA": "II", "STAGE IIB": "II", "STAGE IIC": "II",
-    "STAGE III": "III", "STAGE IIIA": "III", "STAGE IIIB": "III", "STAGE IIIC": "III",
-    "STAGE IV": "IV", "STAGE IVA": "IV", "STAGE IVB": "IV", "STAGE IVC": "IV",
-    "STAGE 0": "0",
-    "I": "I", "IA": "I", "IB": "I",
-    "II": "II", "IIA": "II", "IIB": "II", "IIC": "II",
-    "III": "III", "IIIA": "III", "IIIB": "III", "IIIC": "III",
-    "IV": "IV", "IVA": "IV", "IVB": "IV", "IVC": "IV", "0": "0",
-}
-
-META_COLUMNS = {
-    "Hugo_Symbol", "Entrez_Gene_Id", "Cytoband",
-    "Composite.Element.REF", "ENTITY_STABLE_ID", "NAME",
-    "DESCRIPTION", "TRANSCRIPT_ID", "ID", "GENE_SYMBOL",
-    "PHOSPHOSITE", "geneNames",
-}
+# 染色体臂定义：基于标准人类核型 GRCh38（不含 Y 短臂和线粒体）
+CHROMOSOME_ARMS = [
+    "1p", "1q", "2p", "2q", "3p", "3q", "4p", "4q", "5p", "5q",
+    "6p", "6q", "7p", "7q", "8p", "8q", "9p", "9q", "10p", "10q",
+    "11p", "11q", "12p", "12q", "13q", "14q", "15q", "16p", "16q", "17p", "17q",
+    "18p", "18q", "19p", "19q", "20p", "20q", "21q", "22q", "Xp", "Xq",
+]
 
 FEATURE_SET_CONFIG = {
     "clinical_only": {"clinical": True, "omics": []},
@@ -102,84 +105,6 @@ FEATURE_SET_CONFIG = {
     "clinical_pathway": {"clinical": True, "omics": ["pathway"]},
     "clinical_somatic_mutation": {"clinical": True, "omics": ["mutation"]},
 }
-
-
-def parse_survival_status(series):
-    values = series.fillna("").astype(str).str.strip()
-    lower = values.str.lower()
-    event = (
-        values.str.startswith("1")
-        | lower.isin({"1", "dead", "deceased", "event", "progression",
-                       "yes", "true", "recurred", "recurrence", "progressed"})
-    )
-    censored = (
-        values.str.startswith("0")
-        | lower.isin({"0", "alive", "censored", "no", "false", "living",
-                       "no_progression", "diseasefree"})
-    )
-    result = pd.Series(np.nan, index=series.index)
-    result[event] = 1.0
-    result[censored] = 0.0
-    return result
-
-
-def numeric_series(series):
-    return pd.to_numeric(series.replace(["[Not Available]", "[Not Applicable]", "[Completed]", ""], np.nan), errors="coerce")
-
-
-def stage_to_group(value):
-    if pd.isna(value):
-        return "Unknown"
-    s = str(value).upper().replace("STAGE ", "").strip()
-    if s.startswith("IV"):
-        return "IV"
-    if s.startswith("III"):
-        return "III"
-    if s.startswith("II"):
-        return "II"
-    if s.startswith("I"):
-        return "I"
-    return "Unknown"
-
-
-def rank_inverse_normal(series):
-    s = pd.to_numeric(series, errors="coerce")
-    valid = s.notna()
-    if valid.sum() < 2:
-        return s
-    ranked = rankdata(s[valid].to_numpy())
-    n = len(ranked)
-    from scipy.stats import norm
-    transformed = norm.ppf((ranked - 0.5) / n)
-    result = s.copy()
-    result.loc[valid] = transformed
-    return result
-
-
-def stratified_split_keys(df, columns, min_count=5):
-    combined = df[columns[0]].astype(str)
-    for col in columns[1:]:
-        combined = combined + "_" + df[col].astype(str)
-    counts = combined.value_counts()
-    rare = set(counts[counts < min_count].index)
-    if rare:
-        combined = combined.replace(list(rare), "RARE")
-    return combined
-
-
-def sanitize_filename(name):
-    return re.sub(r"[^\w\-.]", "_", str(name))
-
-
-def make_surv_array(time, event):
-    return Surv.from_arrays(
-        event=np.asarray(event).astype(bool),
-        time=np.asarray(time, dtype=float),
-    )
-
-
-def read_tsv_safe(path, **kwargs):
-    return pd.read_csv(path, sep="\t", low_memory=False, **kwargs)
 
 
 def load_gene_matrix(path, id_col_preference="Hugo_Symbol"):
@@ -203,25 +128,24 @@ def load_gene_matrix(path, id_col_preference="Hugo_Symbol"):
     return mat
 
 
-def patient_id_from_sample(value):
-    text = str(value)
-    if text.startswith("TCGA-") and len(text) >= 12:
-        return text[:12]
-    return text
-
-
 def select_features_train_only(mat, train_ids, min_nonmissing, top_k, forced=None):
     if mat.empty:
+        logger.info(f"    [DIAG] mat is empty, skipping")
         return []
     mat = mat.copy()
     mat.index = mat.index.astype(str)
     train_available = [p for p in train_ids if p in mat.index]
+    logger.info(f"    [DIAG] train_ids={len(train_ids)}, train_available={len(train_available)}, mat.shape={mat.shape}, index_sample={mat.index[:3].tolist()}")
     if not train_available:
+        logger.info(f"    [DIAG] No train samples matched — index mismatch detected!")
         return []
     train = mat.loc[train_available]
     keep_mask = train.notna().mean(axis=0) >= min_nonmissing
+    n_passed_nonmissing = int(keep_mask.sum())
     train = train.loc[:, keep_mask]
+    logger.info(f"    [DIAG] After nonmissing filter (>= {min_nonmissing}): {n_passed_nonmissing}/{mat.shape[1]} features retained")
     if train.empty:
+        logger.info(f"    [DIAG] No features passed nonmissing filter, skipping")
         return []
     variances = train.var(axis=0, skipna=True).sort_values(ascending=False)
     top = variances.head(top_k).index.tolist()
@@ -229,6 +153,52 @@ def select_features_train_only(mat, train_ids, min_nonmissing, top_k, forced=Non
         forced_in = [f for f in forced if f in mat.columns and f not in top]
         return list(dict.fromkeys(forced_in + top))
     return top
+
+
+def aggregate_cnv_to_arm_level(cnv_df):
+    """将基因级别 CNV 矩阵聚合为臂级别特征。
+
+    Args:
+        cnv_df: DataFrame, index=患者ID, columns=基因名, values=CNV值
+
+    Returns:
+        DataFrame, index=患者ID, columns=臂名（CNV_前缀）, values=臂内基因CNV均值
+    """
+    arm_data = {}
+    genes_mapped = 0
+    genes_unmapped = 0
+
+    for gene in cnv_df.columns:
+        gene_upper = str(gene).upper()
+        matched_arm = None
+
+        # 尝试从基因名提取染色体臂信息（如 "1P33", "8Q24" 等格式）
+        m = re.match(r'^(\d{1,2}|X|Y)([PQ])', gene_upper)
+        if m:
+            chrom = m.group(1)
+            arm_letter = m.group(2).lower()
+            arm_name = f"{chrom}{arm_letter}"
+            if arm_name in CHROMOSOME_ARMS:
+                matched_arm = arm_name
+
+        if matched_arm:
+            arm_data.setdefault(matched_arm, []).append(gene)
+            genes_mapped += 1
+        else:
+            genes_unmapped += 1
+
+    logger.info(f"    [CNV] Arm mapping: {genes_mapped} genes mapped to {len(arm_data)} arms, {genes_unmapped} unmapped")
+
+    if not arm_data:
+        logger.warning(f"    [CNV] WARNING: No genes could be mapped to chromosome arms")
+        return pd.DataFrame()
+
+    # 对每个臂取基因 CNV 均值
+    arm_matrix = pd.DataFrame(index=cnv_df.index)
+    for arm_name, genes in sorted(arm_data.items()):
+        arm_matrix[f"CNV_{arm_name}"] = cnv_df[genes].mean(axis=1)
+
+    return arm_matrix
 
 
 def fit_modality_encoder(block, train_mask, dim, seed):
@@ -486,13 +456,27 @@ def metric_uno_and_td_auc(split, risk, horizons_months=(12.0, 36.0, 60.0), survi
     max_train_time = float(split.loc[train_mask, "time_months"].astype(float).max())
     safe_horizons = sorted({float(min(h, max_train_time * 0.95)) for h in horizons_months if h < max_train_time * 0.99})
     out = {}
+    tau = float(np.max(valid_time))  # fallback default
     try:
         tau = float(np.percentile(valid_time[valid_event], 90)) if valid_event.any() else float(np.max(valid_time))
         uno_c, *_ = concordance_index_ipcw(y_train, y_valid, risk_valid, tau=tau)
         out["uno_c_index"] = float(uno_c)
         out["uno_tau_months"] = tau
-    except Exception:
-        pass
+    except Exception as e_ipcw:
+        # IPCW 内部权重过大时（常见于 GAN 增强后极端删失分布），回退到 Harrell's C
+        logger.warning(f"[metric] concordance_index_ipcw failed ({e_ipcw}), falling back to Harrell C-index")
+        try:
+            if np.unique(risk_valid).size >= 2:
+                harrell_c = concordance_index(
+                    valid_time[valid_time > 0],
+                    -risk_valid[valid_time > 0],
+                    valid_event[valid_time > 0],
+                )
+                out["uno_c_index"] = float(harrell_c)
+                out["uno_tau_months"] = tau
+                out["uno_c_index_source"] = "harrell_c_fallback"
+        except Exception:
+            pass
     if safe_horizons:
         try:
             auc, mean_auc = cumulative_dynamic_auc(y_train, y_valid, risk_valid, np.asarray(safe_horizons))
@@ -545,13 +529,31 @@ def transform_clinical_external(df, patient_col, bundle):
     return pd.DataFrame(matrix, columns=transformer["model_columns"], index=df[patient_col].astype(str))
 
 
-def fit_lifelines_cox(x, split, penalizer=0.1):
+def fit_lifelines_cox(x, split, penalizer=1.0):
+    """拟合 lifelines CoxPH 模型。
+
+    penalizer 默认 1.0（Ridge 正则化），防止 AJCC 分期等稀有类别
+    变量引起完全分离 (ConvergenceWarning: complete separation)。
+    若首次拟合仍不收敛，自动以 2x penalizer 重试。
+    """
     train_mask = split["split"].to_numpy() == "train"
     train = x.iloc[train_mask].copy()
     train["time"] = split.loc[train_mask, "time_months"].to_numpy()
     train["event"] = split.loc[train_mask, "event"].astype(int).to_numpy()
     cph = CoxPHFitter(penalizer=penalizer)
-    cph.fit(train, duration_col="time", event_col="event")
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        cph.fit(train, duration_col="time", event_col="event")
+        convergence_issues = [
+            wi for wi in w
+            if "complete separation" in str(wi.message).lower()
+            or "convergence" in str(wi.message).lower()
+        ]
+    if convergence_issues:
+        logger.warning(f"[CoxPH] Convergence issue detected (penalizer={penalizer}), retrying with {penalizer*2}")
+        cph = CoxPHFitter(penalizer=penalizer * 2)
+        cph.fit(train, duration_col="time", event_col="event")
+        penalizer = penalizer * 2
     risk_all = lifelines_predict_log_hazard(cph, x)
     bundle = {
         "model": cph, "model_type": "lifelines_cox",
@@ -660,20 +662,32 @@ def fit_rsf(x, split, seed=RANDOM_SEED):
 
 
 def fit_weighted_logistic(x, split, seed=RANDOM_SEED):
+    """Fits weighted logistic regression with KM-based IPCW weights."""
     train_mask = split["split"].to_numpy() == "train"
     x_train = x.iloc[train_mask]
-    event_col = split.loc[train_mask, "event"].astype(float)
-    time_col = split.loc[train_mask, "time_months"].astype(float)
     tau = FIXED_TAU_MONTHS
-    binary_label = ((event_col == 1) & (time_col <= tau)).astype(int).to_numpy()
-    ipcw_weight = np.ones(len(binary_label))
-    event_mask = event_col == 1
-    censor_mask = ~event_mask
-    if event_mask.sum() > 0 and censor_mask.sum() > 0:
-        event_rate = event_mask.mean()
-        ipcw_weight[event_mask] = 1.0 / max(event_rate, 0.01)
-        ipcw_weight[censor_mask & (time_col < tau)] = 1.0 / max(1 - event_rate, 0.01)
-    ipcw_weight = np.clip(ipcw_weight, 0.5, 10.0)
+
+    # Build endpoint DataFrame for KM-based IPCW
+    train_split = split.loc[train_mask].copy()
+    endpoint_df = pd.DataFrame({
+        "PATIENT_ID": train_split["PATIENT_ID"].astype(str).values,
+        "time_months": train_split["time_months"].astype(float).values,
+        "event": train_split["event"].astype(int).values,
+        # Provide columns that add_fixed_endpoint expects
+        "OS_TIME_MONTHS": train_split["time_months"].astype(float).values,
+        "OS_EVENT": train_split["event"].astype(int).values,
+    })
+    endpoint_df = add_fixed_endpoint(endpoint_df, tau_months=tau)
+    endpoint_df = compute_ipcw_weights(endpoint_df, tau=tau)
+
+    tau_int = int(tau)
+    binary_label = endpoint_df[f"death_by_{tau_int}m"].fillna(0).astype(int).to_numpy()
+    ipcw_weight = endpoint_df[f"ipcw_weight_{tau_int}m"].fillna(1.0).to_numpy()
+    # Winsorization: 1%/99% 分位数截断 + 硬上限 20，防止 GAN 合成样本导致极端权重 → 梯度不稳定
+    w_lo, w_hi = np.percentile(ipcw_weight[ipcw_weight > 0], [1, 99]) if (ipcw_weight > 0).any() else (0.5, 10.0)
+    ipcw_weight = np.clip(ipcw_weight, max(w_lo, 0.1), min(w_hi, 20.0))
+
+    # TODO: sklearn>=1.8 需迁移 penalty="elasticnet" 到 LogisticRegression+ElasticNet
     model = LogisticRegressionCV(
         penalty="elasticnet", solver="saga",
         l1_ratios=[0.05, 0.5, 0.95],
@@ -687,6 +701,286 @@ def fit_weighted_logistic(x, split, seed=RANDOM_SEED):
         "tau_months": tau,
     }
     return model, bundle, risk_all
+
+
+def fit_xgb_cox(x, split, seed=RANDOM_SEED):
+    """XGBoost Cox生存模型。
+
+    使用xgboost原生survival:cox目标函数。
+    若xgbse可用则用KaplanNeighbors估计生存曲线；
+    否则仅输出风险分数。
+    """
+    if not HAS_XGBOOST:
+        raise ImportError("xgboost is not installed")
+
+    train_mask = split["split"].to_numpy() == "train"
+    X_train = x.iloc[train_mask].values
+    X_all = x.values
+
+    y_time = split.loc[train_mask, "time_months"].values.astype(float)
+    y_event = split.loc[train_mask, "event"].values.astype(int)
+
+    # XGB-Cox需要特殊标签格式
+    # 正事件时间 = time, 删失时间 = -time (xgboost convention)
+    y_xgb = np.where(y_event == 1, y_time, -y_time)
+
+    model = xgb.XGBRegressor(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        objective="survival:cox",
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        random_state=seed,
+        n_jobs=-1,
+        verbosity=0,
+    )
+    model.fit(X_train, y_xgb)
+
+    # 风险分数 = exp(margin)，clip 防止指数溢出
+    raw_pred = model.predict(X_all)
+    risk_all = np.exp(np.clip(raw_pred, -30, 30))
+
+    # 尝试用xgbse包装以获得生存曲线
+    xgbse_model = None
+    try:
+        from xgbse import XGBSEKaplanNeighbors
+        xgbse_model = XGBSEKaplanNeighbors(model)
+        xgbse_model.fit(X_train, y_xgb)
+    except Exception:
+        xgbse_model = None
+
+    bundle = {
+        "model": model, "xgbse_model": xgbse_model,
+        "model_type": "xgb_cox",
+        "feature_columns": x.columns.tolist(),
+        "fit_scope": "train_split_only",
+    }
+    return model, bundle, risk_all
+
+
+def fit_gbsa(x, split, seed=RANDOM_SEED):
+    """Gradient Boosting Survival Analysis (scikit-survival)。
+
+    使用Cox偏似然梯度提升，输出风险分数和生存函数。
+    """
+    if GradientBoostingSurvivalAnalysis is None or Surv is None:
+        raise ImportError("scikit-survival is not installed")
+
+    train_mask = split["split"].to_numpy() == "train"
+    X_train = x.iloc[train_mask].values
+    X_all = x.values
+
+    y_train = Surv.from_arrays(
+        time=split.loc[train_mask, "time_months"].values.astype(float),
+        event=split.loc[train_mask, "event"].astype(bool).values,
+    )
+
+    model = GradientBoostingSurvivalAnalysis(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=3,
+        subsample=0.8,
+        min_samples_split=10,
+        min_samples_leaf=8,
+        random_state=seed,
+    )
+    model.fit(X_train, y_train)
+
+    # 风险分数
+    risk_all = model.predict(X_all)
+
+    bundle = {
+        "model": model, "model_type": "gbsa",
+        "feature_columns": x.columns.tolist(),
+        "fit_scope": "train_split_only",
+    }
+    return model, bundle, risk_all
+
+
+def fit_super_learner(x, split, seed=RANDOM_SEED):
+    """Super Learner 元学习器 (van der Laan 2007)。
+
+    使用 K-fold CV 生成基模型预测，然后用元学习器组合。
+    基模型工厂包括: CoxPH, Coxnet, RSF, XGBoost-Cox, GBSA。
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    train_mask = split["split"].to_numpy() == "train"
+    X_all = x.values
+    X_train = x.iloc[train_mask].values
+    y_time_all = split["time_months"].to_numpy().astype(float)
+    y_event_all = split["event"].to_numpy().astype(int)
+    y_time_train = split.loc[train_mask, "time_months"].values.astype(float)
+    y_event_train = split.loc[train_mask, "event"].values.astype(int)
+    n_train = int(train_mask.sum())
+
+    # ---------- 基模型工厂 ----------
+    base_specs = []  # list of (name, factory_fn)
+
+    # 1) CoxPH
+    if CoxPHFitter is not None:
+        def _make_coxph():
+            return CoxPHFitter(penalizer=1.0)  # 增大正则化防止完全分离导致 NaN
+        base_specs.append(("coxph", _make_coxph))
+
+    # 2) Coxnet
+    if CoxnetSurvivalAnalysis is not None:
+        def _make_coxnet():
+            return CoxnetSurvivalAnalysis(alphas=None, n_alphas=20, l1_ratio=0.5, max_iter=200000)
+        base_specs.append(("coxnet", _make_coxnet))
+
+    # 3) RSF
+    if RandomSurvivalForest is not None:
+        def _make_rsf():
+            return RandomSurvivalForest(n_estimators=200, random_state=seed)
+        base_specs.append(("rsf", _make_rsf))
+
+    # 4) XGBoost-Cox
+    if HAS_XGBOOST:
+        def _make_xgb():
+            return xgb.XGBRegressor(
+                objective="survival:cox", n_estimators=200, max_depth=4,
+                learning_rate=0.05, random_state=seed, verbosity=0,
+            )
+        base_specs.append(("xgb_cox", _make_xgb))
+
+    # 5) GBSA
+    if GradientBoostingSurvivalAnalysis is not None:
+        def _make_gbsa():
+            return GradientBoostingSurvivalAnalysis(
+                n_estimators=200, learning_rate=0.05, max_depth=3,
+                random_state=seed,
+            )
+        base_specs.append(("gbsa", _make_gbsa))
+
+    if len(base_specs) == 0:
+        raise RuntimeError("No base learners available for Super Learner")
+
+    learner_names = [s[0] for s in base_specs]
+    n_learners = len(base_specs)
+
+    # ---------- K-Fold CV 生成元特征 ----------
+    n_folds = 5
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    cv_predictions = np.zeros((n_train, n_learners))
+
+    feature_cols = x.columns.tolist()
+
+    for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(X_train)):
+        X_fold_tr = X_train[tr_idx]
+        fold_train_df = x.iloc[np.where(train_mask)[0][tr_idx]].copy()
+        fold_time = y_time_train[tr_idx]
+        fold_event = y_event_train[tr_idx]
+        X_fold_val = X_train[val_idx]
+
+        # 检查 fold 事件数是否足够，避免完全分离
+        n_events_fold = int(fold_event.sum())
+        n_censored_fold = int(len(fold_event) - n_events_fold)
+        if n_events_fold < 3 or n_censored_fold < 3:
+            logger.warning(f"  [Super Learner] fold {fold_idx}: too few events ({n_events_fold}) or censored ({n_censored_fold}), skipping")
+            continue
+
+        for i, (name, factory) in enumerate(base_specs):
+            try:
+                m = factory()
+                if name == "coxph":
+                    fit_df = fold_train_df[feature_cols].copy()
+                    fit_df["_time"] = fold_time
+                    fit_df["_event"] = fold_event
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        m.fit(fit_df, duration_col="_time", event_col="_event")
+                    preds = m.predict_partial_hazard(X_fold_val)
+                    vals = preds.values if hasattr(preds, "values") else np.asarray(preds)
+                    cv_predictions[val_idx, i] = -np.log(np.clip(vals, 1e-10, None))
+                elif name in ("coxnet", "rsf", "gbsa"):
+                    y_struct = Surv.from_arrays(time=fold_time, event=fold_event.astype(bool))
+                    m.fit(X_fold_tr, y_struct)
+                    cv_predictions[val_idx, i] = m.predict(X_fold_val)
+                elif name == "xgb_cox":
+                    y_xgb = np.where(fold_event == 1, fold_time, -fold_time)
+                    m.fit(X_fold_tr, y_xgb)
+                    raw = m.predict(X_fold_val)
+                    cv_predictions[val_idx, i] = np.exp(np.clip(raw, -30, 30))
+            except Exception as e:
+                logger.info(f"  [Super Learner] {name} fold {fold_idx} failed: {e}")
+                cv_predictions[val_idx, i] = 0.0
+
+    # ---------- 元学习器 ----------
+    # L2 正则化 (C=0.5) 防止元学习器过拟合 + class_weight 平衡事件比例
+    meta_learner = LogisticRegression(penalty="l2", C=0.5, max_iter=2000, random_state=seed, solver="lbfgs")
+    meta_learner.fit(cv_predictions, y_event_train)
+
+    # ---------- 训练集训练最终基模型 ----------
+    final_models = {}
+    for name, factory in base_specs:
+        try:
+            m = factory()
+            if name == "coxph":
+                fit_df = x.iloc[train_mask].copy()       # 仅训练集
+                fit_df["_time"] = y_time_train
+                fit_df["_event"] = y_event_train
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    m.fit(fit_df, duration_col="_time", event_col="_event")
+                final_models[name] = m
+            elif name in ("coxnet", "rsf", "gbsa"):
+                y_struct = Surv.from_arrays(time=y_time_train, event=y_event_train.astype(bool))
+                m.fit(X_train, y_struct)                  # X_train 非 X_all
+                final_models[name] = m
+            elif name == "xgb_cox":
+                y_xgb = np.where(y_event_train == 1, y_time_train, -y_time_train)
+                m.fit(X_train, y_xgb)                     # X_train 非 X_all
+                final_models[name] = m
+        except Exception as e:
+            logger.info(f"  [Super Learner] full-data training {name} failed: {e}")
+
+    logger.info(f"  Super Learner base learners: {learner_names}")
+    logger.info(f"  Meta-learner coefficients: {dict(zip(learner_names, meta_learner.coef_[0]))}")
+
+    # ---------- 全量数据风险预测（基模型仅训练集训练，对全量数据做预测） ----------
+    risk_all = _predict_super_learner_risk(
+        meta_learner, final_models, learner_names, x, X_all
+    )
+
+    bundle = {
+        "meta_learner": meta_learner,
+        "base_learners": final_models,
+        "learner_names": learner_names,
+        "feature_columns": feature_cols,
+        "model_type": "super_learner",
+        "fit_scope": "train_split_only_cv_meta",
+    }
+    return bundle, bundle, risk_all
+
+
+def _predict_super_learner_risk(meta_learner, base_models, learner_names, x, X_arr):
+    """Super Learner 预测风险分数（内部辅助函数）。"""
+    n = len(X_arr)
+    base_preds = np.zeros((n, len(learner_names)))
+    for i, name in enumerate(learner_names):
+        model = base_models.get(name)
+        if model is None:
+            base_preds[:, i] = 0.0
+            continue
+        try:
+            if name == "coxph":
+                preds = model.predict_partial_hazard(X_arr)
+                vals = preds.values if hasattr(preds, "values") else np.asarray(preds)
+                base_preds[:, i] = -np.log(np.clip(vals, 1e-10, None))
+            elif name in ("coxnet", "rsf", "gbsa"):
+                base_preds[:, i] = model.predict(X_arr)
+            elif name == "xgb_cox":
+                raw = model.predict(X_arr)
+                base_preds[:, i] = np.exp(np.clip(raw, -30, 30))
+        except Exception:
+            base_preds[:, i] = 0.0
+    # 清理 inf/nan 后再交给 meta-learner
+    base_preds = np.nan_to_num(base_preds, nan=0.0, posinf=1e10, neginf=-1e10)
+    return meta_learner.predict_proba(base_preds)[:, 1]
 
 
 def select_primary_model(metric_df, policy="survival_composite"):
@@ -713,7 +1007,7 @@ def select_primary_model(metric_df, policy="survival_composite"):
         + 0.15 * candidates["neg_brier_filled"]
         + 0.05 * candidates["parsimony_score"].fillna(0.0)
     )
-    candidates["omics_or_ensemble"] = candidates["model_key"].str.contains("embedding|multiomics|rna|coxnet|ensemble", case=False, na=False)
+    candidates["omics_or_ensemble"] = candidates["model_key"].str.contains("embedding|multiomics|rna|coxnet|ensemble|super_learner", case=False, na=False)
     candidates = candidates.sort_values(["selection_score", "internal_c_index"], ascending=False, na_position="last")
     selected_row = candidates.iloc[0].copy()
     clinical_candidates = candidates.loc[~candidates["omics_or_ensemble"]].copy()
@@ -782,7 +1076,7 @@ class ConditionalTabularGAN:
 
     def __init__(self, latent_dim=32, epochs=300, batch_size=32, n_critic=5,
                  lambda_gp=10.0, lr=2e-4, patience=30, random_seed=RANDOM_SEED,
-                 skip_scaler=False, hidden_dim=128, dropout=0.3, weight_decay=1e-5):
+                 skip_scaler=False, hidden_dim=256, dropout=0.1, weight_decay=1e-5):
         self.latent_dim = latent_dim
         self.epochs = epochs
         self.batch_size = batch_size
@@ -807,17 +1101,21 @@ class ConditionalTabularGAN:
     def _build_generator(self, input_dim, output_dim):
         h = self.hidden_dim
         return nn.Sequential(
-            nn.Linear(input_dim, h), nn.LayerNorm(h), nn.ReLU(inplace=True), nn.Dropout(self.dropout),
-            nn.Linear(h, h), nn.LayerNorm(h), nn.ReLU(inplace=True),
+            nn.Linear(input_dim, h), nn.BatchNorm1d(h), nn.ReLU(inplace=True), nn.Dropout(self.dropout),
+            nn.Linear(h, h), nn.BatchNorm1d(h), nn.ReLU(inplace=True),
             nn.Linear(h, output_dim),
         )
 
     def _build_discriminator(self, input_dim):
+        from torch.nn.utils import spectral_norm
         h = self.hidden_dim
+        disc_dropout = 0.15
         return nn.Sequential(
-            nn.Linear(input_dim, h), nn.LayerNorm(h), nn.LeakyReLU(0.2), nn.Dropout(self.dropout),
-            nn.Linear(h, h), nn.LayerNorm(h), nn.LeakyReLU(0.2),
-            nn.Linear(h, 1),
+            spectral_norm(nn.Linear(input_dim, h)),
+            nn.LayerNorm(h), nn.LeakyReLU(0.2), nn.Dropout(disc_dropout),
+            spectral_norm(nn.Linear(h, h)),
+            nn.LayerNorm(h), nn.LeakyReLU(0.2), nn.Dropout(disc_dropout),
+            spectral_norm(nn.Linear(h, 1)),
         )
 
     @staticmethod
@@ -854,6 +1152,9 @@ class ConditionalTabularGAN:
         discriminator = self._build_discriminator(output_dim + 1)
         opt_g = torch.optim.Adam(generator.parameters(), lr=self.lr, betas=(0.0, 0.9), weight_decay=self.weight_decay)
         opt_d = torch.optim.Adam(discriminator.parameters(), lr=self.lr, betas=(0.0, 0.9))
+        from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+        scheduler_g = CosineAnnealingWarmRestarts(opt_g, T_0=50, T_mult=2)
+        scheduler_d = CosineAnnealingWarmRestarts(opt_d, T_0=50, T_mult=2)
         n = len(data)
         monitor_n = min(max(self.batch_size, 16), n)
         monitor_idx = torch.arange(monitor_n)
@@ -910,9 +1211,11 @@ class ConditionalTabularGAN:
                     best_state = {k: v.detach().clone() for k, v in generator.state_dict().items()}
                 else:
                     patience_counter += 1
-                self.training_history.append({"epoch": epoch + 1, "d_loss": epoch_d_loss / n_steps, "g_loss": epoch_g_loss / n_steps, "monitor_qc_score": monitor_score})
+                self.training_history.append({"epoch": epoch + 1, "d_loss": epoch_d_loss / n_steps, "g_loss": epoch_g_loss / n_steps, "monitor_qc_score": monitor_score, "best_epoch": float(best_epoch)})
                 if patience_counter >= self.patience:
                     break
+            scheduler_g.step()
+            scheduler_d.step()
         if best_state is not None:
             generator.load_state_dict(best_state)
         self.generator = generator
@@ -982,6 +1285,9 @@ class SurvivalConditionalTabularGAN(ConditionalTabularGAN):
         discriminator = self._build_discriminator(output_dim + self.condition_dim)
         opt_g = torch.optim.Adam(generator.parameters(), lr=self.lr, betas=(0.0, 0.9), weight_decay=self.weight_decay)
         opt_d = torch.optim.Adam(discriminator.parameters(), lr=self.lr, betas=(0.0, 0.9))
+        from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+        scheduler_g = CosineAnnealingWarmRestarts(opt_g, T_0=50, T_mult=2)
+        scheduler_d = CosineAnnealingWarmRestarts(opt_d, T_0=50, T_mult=2)
         n = len(data)
         monitor_n = min(max(self.batch_size, 16), n)
         monitor_idx = torch.arange(monitor_n)
@@ -1037,14 +1343,19 @@ class SurvivalConditionalTabularGAN(ConditionalTabularGAN):
                     best_score = monitor_score
                     best_epoch = epoch + 1
                     patience_counter = 0
-                    best_state = {k: v.detach().clone() for k, v in generator.state_dict().items()}
+                    best_state = {
+                        "generator": {k: v.detach().clone() for k, v in generator.state_dict().items()},
+                        "discriminator": {k: v.detach().clone() for k, v in discriminator.state_dict().items()},
+                    }
                 else:
                     patience_counter += 1
                 self.training_history.append({"epoch": epoch + 1, "d_loss": epoch_d_loss / n_steps, "g_loss": epoch_g_loss / n_steps, "gp": epoch_gp / n_steps, "monitor_qc_score": monitor_score, "best_epoch": float(best_epoch)})
                 if patience_counter >= self.patience:
                     break
+            scheduler_g.step()
+            scheduler_d.step()
         if best_state is not None:
-            generator.load_state_dict(best_state)
+            generator.load_state_dict(best_state["generator"])
         self.generator = generator
         self.status = "fitted"
         return self
@@ -1433,17 +1744,44 @@ def decision_curve_analysis(time, event, risk, horizon_months, thresholds):
     if n == 0:
         return pd.DataFrame()
     cal_df = pd.DataFrame({"_t": time, "_e": event, "_r": risk})
+    # 标准化风险分数，避免极端值导致 Cox 拟合不收敛
+    risk_std = risk.std()
+    if risk_std > 1e-8:
+        cal_df["_r"] = (risk - risk.mean()) / risk_std
+    else:
+        cal_df["_r"] = 0.0
+    # 方案 C: 先将 risk 标准化到 [0,1] 再拟合 CoxPH，改善收敛
+    risk_min, risk_max = risk.min(), risk.max()
+    if risk_max - risk_min > 1e-8:
+        risk_norm = (risk - risk_min) / (risk_max - risk_min)
+    else:
+        risk_norm = np.full(n, 0.5)
+    cal_df["_r_norm"] = risk_norm
     try:
-        cph = CoxPHFitter()
-        cph.fit(cal_df, duration_col="_t", event_col="_e")
+        cph = CoxPHFitter(penalizer=0.5)  # 增大正则化提升稳定性
+        cph.fit(cal_df[["_r_norm", "_t", "_e"]], duration_col="_t", event_col="_e")
         breslow = cph.baseline_cumulative_hazard_
         h0_col = breslow.iloc[(breslow.index - horizon_months).abs().argmin()]
-        ph = cph.predict_partial_hazard(cal_df[["_r"]]).to_numpy().ravel()
+        ph = cph.predict_partial_hazard(cal_df[["_r_norm"]]).to_numpy().ravel()
         H_ind = np.clip(h0_col * ph, 0, 30)
         prob_event = np.clip(1.0 - np.exp(-H_ind), 0.0, 0.999)
     except Exception:
-        warnings.warn("DCA: Cox calibration failed; using rank-based proxy.", stacklevel=2)
-        prob_event = (risk.argsort().argsort() + 1.0) / (n + 1)
+        # 回退: isotonic regression 校准 (保留单调性，优于纯秩次)
+        logger.info("DCA: Cox calibration failed; using isotonic regression proxy.")
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            ir = IsotonicRegression(out_of_bounds="clip")
+            # 以 KM 估计的经验事件率作为校准目标
+            kmf_cal = KaplanMeierFitter().fit(time, event)
+            try:
+                overall_rate = 1.0 - float(kmf_cal.predict(horizon_months))
+            except Exception:
+                overall_rate = float(event.mean())
+            ranks = pd.Series(risk).rank(method="average", pct=True).to_numpy()
+            ir.fit(ranks, np.where(risk >= np.median(risk), overall_rate * 1.5, overall_rate * 0.5))
+            prob_event = ir.predict(ranks).clip(0.001, 0.999)
+        except Exception:
+            prob_event = (risk.argsort().argsort() + 1.0) / (n + 1)
     kmf_all = KaplanMeierFitter().fit(time, event)
     try:
         surv_all = float(kmf_all.predict(horizon_months))
@@ -1617,13 +1955,13 @@ def main():
     prev01 = os.path.join(RESULTS_DIR, timestamp, "01_preprocessing")
     prev02 = os.path.join(RESULTS_DIR, timestamp, "02_gene_features")
 
-    print(f"[03] Loading 01 preprocessing outputs from {prev01}")
+    logger.info(f"[03] Loading 01 preprocessing outputs from {prev01}")
     clinical = pd.read_csv(os.path.join(prev01, "tcga_os_clinical_endpoint_qc.tsv"), sep="\t", low_memory=False)
     clinical["PATIENT_ID"] = clinical["PATIENT_ID"].astype(str)
     clinical["OS_MONTHS"] = pd.to_numeric(clinical["OS_MONTHS"], errors="coerce")
     clinical["OS_EVENT"] = clinical["OS_EVENT"].fillna(False).astype(bool).astype(int)
     clinical = clinical.loc[clinical["PATIENT_ID"].notna() & clinical["OS_MONTHS"].notna() & (clinical["OS_MONTHS"] > 0)].copy()
-    print(f"[03] Clinical: {len(clinical)} patients, {int(clinical['OS_EVENT'].sum())} events")
+    logger.info(f"[03] Clinical: {len(clinical)} patients, {int(clinical['OS_EVENT'].sum())} events")
 
     gene_expr_path = os.path.join(prev01, "gene_expression_curated.tsv")
     if os.path.exists(gene_expr_path):
@@ -1631,22 +1969,28 @@ def main():
         gene_expr = gene_expr.apply(pd.to_numeric, errors="coerce")
     else:
         gene_expr = pd.DataFrame()
-    print(f"[03] Gene expression: {gene_expr.shape}")
+    logger.info(f"[03] Gene expression: {gene_expr.shape}")
 
     omics_mats = {}
     for omics_name, fname in [("mutation", "mutation_curated.tsv"), ("cnv", "cnv_curated.tsv"),
                                ("methylation", "methylation_curated.tsv"), ("rppa", "rppa_curated.tsv")]:
         fpath = os.path.join(prev01, fname)
         if os.path.exists(fpath):
-            df = pd.read_csv(fpath, sep="\t", low_memory=False)
+            df = pd.read_csv(fpath, sep="\t", index_col=0, low_memory=False)
             if "PATIENT_ID" in df.columns:
                 df = df.set_index("PATIENT_ID")
             df = df.apply(pd.to_numeric, errors="coerce")
             df.index = df.index.astype(str)
             omics_mats[omics_name] = df
-            print(f"[03] {omics_name}: {df.shape}")
+            logger.info(f"[03] Loaded {omics_name}: {df.shape[0]} samples x {df.shape[1]} features, index sample: {df.index[:3].tolist()}")
 
-    print(f"[03] Loading 02 gene features from {prev02}")
+    # NOTE: RPPA 暂不纳入多组学建模。文献依据：
+    # - TCGA-COAD RPPA 样本覆盖率仅 60-70%，与 RNA-seq 共有样本约 300-400 例
+    # - RPPA 仅覆盖 ~200 个蛋白/磷酸化位点，信息量有限
+    # - Clarke et al. (2017) Ann Surg Oncol 表明 RPPA 蛋白分型虽有独立预后价值，但增量有限
+    # - 当前 pipeline 以 RNA + 甲基化 + 突变为核心组学组合
+
+    logger.info(f"[03] Loading 02 gene features from {prev02}")
     gene_list_path = os.path.join(prev02, "final_gene_list.pkl")
     if os.path.exists(gene_list_path):
         import pickle as _pkl
@@ -1654,7 +1998,7 @@ def main():
             candidate_genes = _pkl.load(f)
     else:
         candidate_genes = []
-    print(f"[03] Candidate genes from 02: {len(candidate_genes)}")
+    logger.info(f"[03] Candidate genes from 02: {len(candidate_genes)}")
 
     split_path = os.path.join(RESULTS_DIR, timestamp, "01_preprocessing", "tcga_train_internal_validation_split.tsv")
     if not os.path.exists(split_path):
@@ -1670,13 +2014,13 @@ def main():
         valid_ids = [pid for pid in valid_ids_raw if pid in clinical_ids]
         # 更新 split_df 以反映过滤后的ID
         split_df = split_df[split_df["PATIENT_ID"].isin(train_ids + valid_ids)].copy()
-        print(f"[03] Predefined split: train_raw={len(train_ids_raw)}->filtered={len(train_ids)}, valid_raw={len(valid_ids_raw)}->filtered={len(valid_ids)}")
+        logger.info(f"[03] Predefined split: train_raw={len(train_ids_raw)}->filtered={len(train_ids)}, valid_raw={len(valid_ids_raw)}->filtered={len(valid_ids)}")
     else:
         split_df = make_stratified_split(clinical, "OS", 0.25, RANDOM_SEED)
         train_ids = split_df.loc[split_df["split"] == "train", "PATIENT_ID"].tolist()
         valid_ids = split_df.loc[split_df["split"] == "internal_validation", "PATIENT_ID"].tolist()
         split_df.to_csv(os.path.join(out_dir, "train_valid_split.tsv"), sep="\t", index=False)
-        print(f"[03] Generated split: train={len(train_ids)}, valid={len(valid_ids)}")
+        logger.info(f"[03] Generated split: train={len(train_ids)}, valid={len(valid_ids)}")
 
     split_df["time_months"] = clinical.set_index("PATIENT_ID").reindex(split_df["PATIENT_ID"].values)["OS_MONTHS"].values
     split_df["event"] = clinical.set_index("PATIENT_ID").reindex(split_df["PATIENT_ID"].values)["OS_EVENT"].values
@@ -1685,7 +2029,7 @@ def main():
     valid_mask = clinical["PATIENT_ID"].isin(valid_ids).to_numpy()
     patients = clinical["PATIENT_ID"].astype(str).tolist()
 
-    print("[03] Step 1: Multi-omics fusion...")
+    logger.info("[03] Step 1: Multi-omics fusion...")
     embeddings = {}
     bundles = {}
     masks_per_patient = {}
@@ -1700,10 +2044,32 @@ def main():
             bundles["rna"] = bundle
             rna_avail = np.array([1.0 if p in gene_expr.index.astype(str) else 0.0 for p in patients])
             masks_per_patient["rna"] = rna_avail
-            print(f"[03] RNA embedding: {emb.shape}")
+            logger.info(f"[03] RNA embedding: {emb.shape}")
 
+    OMICS_THRESHOLDS = {
+        "mutation":    {"min_nonmissing": 0.7, "top_k": 500},
+        "cnv":         {"min_nonmissing": 0.7, "top_k": 500},
+        "methylation": {"min_nonmissing": 0.5, "top_k": 500},
+        "rppa":        {"min_nonmissing": 0.5, "top_k": 200},
+    }
     for omics_name, mat in omics_mats.items():
-        feats = select_features_train_only(mat, train_ids, min_nonmissing=0.7, top_k=500)
+        thresh = OMICS_THRESHOLDS.get(omics_name, {"min_nonmissing": 0.7, "top_k": 500})
+        feats = select_features_train_only(mat, train_ids,
+                                            min_nonmissing=thresh["min_nonmissing"],
+                                            top_k=thresh["top_k"])
+        logger.info(f"[03] {omics_name}: selected {len(feats)} features from {mat.shape[1]} (min_nonmissing={thresh['min_nonmissing']}, top_k={thresh['top_k']})")
+        # CNV 特殊处理：同时保留基因级别 top 特征和臂级别聚合特征
+        if omics_name == "cnv":
+            train_available_for_cnv = [p for p in train_ids if p in mat.index.astype(str)]
+            if train_available_for_cnv:
+                arm_cnv = aggregate_cnv_to_arm_level(mat)
+                if not arm_cnv.empty:
+                    arm_feats = arm_cnv.columns.tolist()
+                    # 臂级别特征直接加入（维度已很低，无需 top_k 筛选）
+                    feats = feats + [f for f in arm_feats if f not in feats]
+                    for col in arm_cnv.columns:
+                        mat[col] = arm_cnv[col]
+                    logger.info(f"[03] CNV: added {len(arm_feats)} arm-level features, total features: {len(feats)}")
         if not feats:
             continue
         block = mat[feats].reindex(patients)
@@ -1715,7 +2081,7 @@ def main():
         bundles[omics_name] = bundle
         avail = np.array([1.0 if p in mat.index.astype(str) else 0.0 for p in patients])
         masks_per_patient[omics_name] = avail
-        print(f"[03] {omics_name} embedding: {emb.shape}")
+        logger.info(f"[03] {omics_name} embedding: {emb.shape}")
 
     stability = stability_via_subspace_overlap(
         {k: v.reindex(patients) for k, v in {"rna": gene_expr, **omics_mats}.items() if not v.empty},
@@ -1729,12 +2095,12 @@ def main():
         fused_df, fused_columns = multi_omics_concat(embeddings, masks_per_patient, patients)
         fused_for_save = fused_df.copy() if not fused_df.empty else pd.DataFrame({"PATIENT_ID": patients})
         fused_for_save.to_csv(os.path.join(out_dir, "tcga_multiomics_patient_embedding.tsv"), sep="\t", index=False)
-        print(f"[03] Fused embedding saved: {fused_for_save.shape}")
+        logger.info(f"[03] Fused embedding saved: {fused_for_save.shape}")
     else:
         fused_df = pd.DataFrame({"PATIENT_ID": patients})
         fused_columns = []
         fused_df.to_csv(os.path.join(out_dir, "tcga_multiomics_patient_embedding.tsv"), sep="\t", index=False)
-        print("[03] No multi-omics embeddings; saved patient ID-only embedding")
+        logger.info("[03] No multi-omics embeddings; saved patient ID-only embedding")
 
     clin_features = ["AGE", "SEX", "AJCC_PATHOLOGIC_TUMOR_STAGE", "SUBTYPE", "CANCER_TYPE_ACRONYM"]
     clin_features = [c for c in clin_features if c in clinical.columns]
@@ -1765,7 +2131,7 @@ def main():
 
     imp = SimpleImputer(strategy="median")
     X_all_imp = pd.DataFrame(imp.fit_transform(X_all), columns=X_all.columns, index=X_all.index)
-    print(f"[03] Feature matrix: {X_all_imp.shape}")
+    logger.info(f"[03] Feature matrix: {X_all_imp.shape}")
 
     endpoint = clinical.set_index("PATIENT_ID")[["OS_MONTHS", "OS_EVENT"]].rename(
         columns={"OS_MONTHS": "time_months", "OS_EVENT": "event"}
@@ -1783,7 +2149,7 @@ def main():
     endpoint_train = endpoint.loc[endpoint.index.isin(train_ids)]
 
     if not skip_gan and HAS_TORCH:
-        print(f"[03] Step 2: GAN augmentation (epochs={gan_epochs})...")
+        logger.info(f"[03] Step 2: GAN augmentation (epochs={gan_epochs})...")
         gan_result, gan_info = train_only_gan_augmentation(X_all_imp, endpoint, train_ids, gan_epochs, RANDOM_SEED)
         if gan_result is not None and gan_result.get("qc", {}).get("passed", False):
             X_aug = gan_result["X_aug"]
@@ -1814,23 +2180,23 @@ def main():
                     plt.close(fig)
                 except Exception:
                     pass
-            print(f"[03] GAN augmentation: {n_syn} synthetic samples, QC passed")
+            logger.info(f"[03] GAN augmentation: {n_syn} synthetic samples, QC passed")
         else:
             X_train_aug = X_all_imp.loc[X_all_imp.index.isin(train_ids)]
             endpoint_train_aug = endpoint_train.copy()
-            print(f"[03] GAN augmentation: skipped or QC failed ({gan_info.get('status', 'unknown')})")
+            logger.info(f"[03] GAN augmentation: skipped or QC failed ({gan_info.get('status', 'unknown')})")
     else:
         if skip_gan:
-            print("[03] Step 2: GAN skipped (--skip-gan)")
+            logger.info("[03] Step 2: GAN skipped (--skip-gan)")
         else:
-            print("[03] Step 2: GAN skipped (torch not available)")
+            logger.info("[03] Step 2: GAN skipped (torch not available)")
         X_train_aug = X_all_imp.loc[X_all_imp.index.isin(train_ids)]
         endpoint_train_aug = endpoint_train.copy()
 
     X_train = X_all_imp.loc[X_all_imp.index.isin(train_ids)]
     X_valid = X_all_imp.loc[X_all_imp.index.isin(valid_ids)]
 
-    print("[03] Step 3: Model training...")
+    logger.info("[03] Step 3: Model training...")
     trained_models = {}
     model_bundles = {}
     risk_all = {}
@@ -1842,9 +2208,9 @@ def main():
             model_bundles["cox_ph"] = cox_bundle
             risk_all["cox_ph"] = cox_risk_all
             joblib.dump(cox_bundle, os.path.join(models_dir, "clinical_full_cox.joblib"))
-            print(f"[03] CoxPH trained with {len(cox_bundle['feature_columns'])} features")
+            logger.info(f"[03] CoxPH trained with {len(cox_bundle['feature_columns'])} features")
         except Exception as e:
-            print(f"[03] CoxPH failed: {e}")
+            logger.info(f"[03] CoxPH failed: {e}")
 
         try:
             clin_only_cols = [c for c in clin_x.columns if c in X_all_imp.columns] if not clin_x.empty else []
@@ -1852,9 +2218,9 @@ def main():
                 X_clin_only = X_all_imp[clin_only_cols]
                 clin_ajcc_model, clin_ajcc_bundle, clin_ajcc_risk = fit_lifelines_cox(X_clin_only, split_df)
                 joblib.dump(clin_ajcc_bundle, os.path.join(models_dir, "clinical_ajcc_cox.joblib"))
-                print(f"[03] Clinical AJCC Cox trained with {len(clin_only_cols)} features")
+                logger.info(f"[03] Clinical AJCC Cox trained with {len(clin_only_cols)} features")
         except Exception as e:
-            print(f"[03] Clinical AJCC Cox failed: {e}")
+            logger.info(f"[03] Clinical AJCC Cox failed: {e}")
 
     if CoxnetSurvivalAnalysis is not None and Surv is not None and endpoint_train_aug["event"].sum() >= 5:
         try:
@@ -1867,9 +2233,9 @@ def main():
             joblib.dump(coxnet_bundle, os.path.join(models_dir, "expression_coxnet.joblib"))
             with open(os.path.join(eval_dir, "coxnet_cv_summary.json"), "w") as f:
                 json.dump(cv_summary, f, indent=2)
-            print(f"[03] Coxnet trained: {cv_summary['non_zero_features']} non-zero features")
+            logger.info(f"[03] Coxnet trained: {cv_summary['non_zero_features']} non-zero features")
         except Exception as e:
-            print(f"[03] Coxnet failed: {e}")
+            logger.info(f"[03] Coxnet failed: {e}")
 
     if RandomSurvivalForest is not None and Surv is not None and endpoint_train_aug["event"].sum() >= 5:
         try:
@@ -1878,9 +2244,9 @@ def main():
             model_bundles["rsf"] = rsf_bundle
             risk_all["rsf"] = rsf_risk_all
             joblib.dump(rsf_bundle, os.path.join(models_dir, "clinical_random_survival_forest.joblib"))
-            print("[03] RSF trained")
+            logger.info("[03] RSF trained")
         except Exception as e:
-            print(f"[03] RSF failed: {e}")
+            logger.info(f"[03] RSF failed: {e}")
 
     try:
         log_model, log_bundle, log_risk_all = fit_weighted_logistic(X_all_imp, split_df)
@@ -1888,11 +2254,51 @@ def main():
         model_bundles["logistic"] = log_bundle
         risk_all["logistic"] = log_risk_all
         joblib.dump(log_bundle, os.path.join(models_dir, "weighted_logistic_ipcw.joblib"))
-        print("[03] Weighted Logistic trained")
+        logger.info("[03] Weighted Logistic trained")
     except Exception as e:
-        print(f"[03] Logistic failed: {e}")
+        logger.info(f"[03] Logistic failed: {e}")
 
-    print("[03] Step 4: Internal validation...")
+    # ---- XGBoost-Cox ----
+    if HAS_XGBOOST:
+        try:
+            xgb_model, xgb_bundle, xgb_risk_all = fit_xgb_cox(X_all_imp, split_df)
+            trained_models["xgb_cox"] = xgb_model
+            model_bundles["xgb_cox"] = xgb_bundle
+            risk_all["xgb_cox"] = xgb_risk_all
+            joblib.dump(xgb_bundle, os.path.join(models_dir, "xgb_cox.joblib"))
+            logger.info("[03] XGBoost-Cox trained")
+        except ImportError:
+            logger.warning("[03] xgboost not available, skipping XGBoost-Cox")
+        except Exception as e:
+            logger.info(f"[03] XGBoost-Cox failed: {e}")
+    else:
+        logger.info("[03] xgboost not available, skipping XGBoost-Cox")
+
+    # ---- GBSA ----
+    if GradientBoostingSurvivalAnalysis is not None and Surv is not None and endpoint_train_aug["event"].sum() >= 5:
+        try:
+            gbsa_model, gbsa_bundle, gbsa_risk_all = fit_gbsa(X_all_imp, split_df)
+            trained_models["gbsa"] = gbsa_model
+            model_bundles["gbsa"] = gbsa_bundle
+            risk_all["gbsa"] = gbsa_risk_all
+            joblib.dump(gbsa_bundle, os.path.join(models_dir, "gbsa.joblib"))
+            logger.info("[03] GBSA trained")
+        except Exception as e:
+            logger.info(f"[03] GBSA failed: {e}")
+
+    # ---- Super Learner ----
+    if Surv is not None and endpoint_train_aug["event"].sum() >= 5:
+        try:
+            sl_model, sl_bundle, sl_risk_all = fit_super_learner(X_all_imp, split_df)
+            trained_models["super_learner"] = sl_model
+            model_bundles["super_learner"] = sl_bundle
+            risk_all["super_learner"] = sl_risk_all
+            joblib.dump(sl_bundle, os.path.join(models_dir, "super_learner.joblib"))
+            logger.info("[03] Super Learner trained")
+        except Exception as e:
+            logger.info(f"[03] Super Learner failed: {e}")
+
+    logger.info("[03] Step 4: Internal validation...")
     eval_results = {}
     metric_rows = []
     for model_name, r in risk_all.items():
@@ -1904,7 +2310,7 @@ def main():
             boot = bootstrap_harrell(time_v, event_v, valid_r, 200, RANDOM_SEED)
             uno_metrics = metric_uno_and_td_auc(
                 split_df, r, horizons_months=(12.0, 36.0),
-                survival_estimator=lifelines_survival_estimator(trained_models[model_name], X_valid) if model_name == "cox_ph" else None,
+                survival_estimator=lifelines_survival_estimator(trained_models[model_name], X_valid) if model_name == "cox_ph" else (sksurv_survival_estimator(trained_models[model_name], X_valid.values) if model_name in ("gbsa", "rsf") else None),
             )
             eval_results[model_name] = {
                 "model": model_name, "c_index": c_idx,
@@ -1912,9 +2318,9 @@ def main():
                 "n_bootstrap": boot["n_valid"], **uno_metrics,
             }
             metric_rows.append({"model": model_name, "metric": "harrell_c_index", "observed_value": c_idx, **uno_metrics})
-            print(f"[03] {model_name}: C-index={c_idx:.4f} [{boot['ci_low']:.4f}, {boot['ci_high']:.4f}]")
+            logger.info(f"[03] {model_name}: C-index={c_idx:.4f} [{boot['ci_low']:.4f}, {boot['ci_high']:.4f}]")
         except Exception as e:
-            print(f"[03] {model_name} evaluation failed: {e}")
+            logger.info(f"[03] {model_name} evaluation failed: {e}")
 
     eval_df = pd.DataFrame(list(eval_results.values()))
     eval_df.to_csv(os.path.join(eval_dir, "internal_validation_model_comparison.tsv"), sep="\t", index=False)
@@ -1929,7 +2335,7 @@ def main():
     best_model_name, selection_rationale = select_primary_model(metric_df)
     with open(os.path.join(eval_dir, "primary_model_selection.json"), "w") as f:
         json.dump(selection_rationale, f, indent=2)
-    print(f"[03] Primary model selected: {best_model_name}")
+    logger.info(f"[03] Primary model selected: {best_model_name}")
 
     train_time_arr = split_df.loc[split_df["split"] == "train", "time_months"].values.astype(float)
     train_event_arr = split_df.loc[split_df["split"] == "train", "event"].values.astype(int)
@@ -1950,7 +2356,7 @@ def main():
             if not dca_df.empty:
                 plot_dca(dca_df, "tcga_internal", model_name, fig_dir)
         except Exception as e:
-            print(f"[03] {model_name} plot generation failed: {e}")
+            logger.info(f"[03] {model_name} plot generation failed: {e}")
 
     risk_dist_data = {}
     for model_name, r in risk_all.items():
@@ -1958,7 +2364,7 @@ def main():
     if risk_dist_data:
         plot_risk_distribution(risk_dist_data, "tcga_internal", fig_dir)
 
-    print("[03] Step 5: External validation skipped (internal validation only mode).")
+    logger.info("[03] Step 5: External validation skipped (internal validation only mode).")
     external_cohorts = {}
     external_results = []
 
@@ -1968,7 +2374,7 @@ def main():
     if all_bundles:
         joblib.dump(all_bundles, os.path.join(models_dir, "all_fitted_model_bundles.joblib"))
 
-    print("[03] Step 6: Generating figures...")
+    logger.info("[03] Step 6: Generating figures...")
 
     if eval_results:
         fig, ax = plt.subplots(figsize=(10, 6))
@@ -2060,7 +2466,7 @@ def main():
     with open(os.path.join(eval_dir, "selected_primary_model_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 
-    print("[03] Step 7: Saving final results...")
+    logger.info("[03] Step 7: Saving final results...")
     summary = {
         "timestamp": timestamp,
         "n_train": int(train_mask.sum()),
@@ -2085,7 +2491,7 @@ def main():
     if bundles:
         joblib.dump(bundles, os.path.join(models_dir, "modality_encoders.pkl"))
 
-    print(f"[03] Complete! Results in: {out_dir}")
+    logger.info(f"[03] Complete! Results in: {out_dir}")
 
 
 if __name__ == "__main__":
