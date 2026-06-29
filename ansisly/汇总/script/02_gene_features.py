@@ -632,7 +632,13 @@ def dose_response_summary(exposure, outcome, n_bins=5):
 
 
 def run_causal_screening(feature_matrix, clinical_adjustment, endpoint_train,
-                         random_seed, max_features):
+                         random_seed, max_features, tau_months=None):
+    """Run causal screening with endpoint-specific tau.
+
+    Args:
+        tau_months: endpoint-specific tau for RMST. If None, uses FIXED_TAU_MONTHS.
+    """
+    effective_tau = float(tau_months) if tau_months is not None else FIXED_TAU_MONTHS
     common = feature_matrix.index.intersection(endpoint_train.index)
     X_adj = clinical_adjustment.reindex(common).fillna(0)
     time_months = endpoint_train.reindex(common)["time_months"].to_numpy(dtype=float)
@@ -646,7 +652,7 @@ def run_causal_screening(feature_matrix, clinical_adjustment, endpoint_train,
         exposure_binary = (x > x.median()).astype(int)
         rmst_dr = causal_rmst_doubly_robust(
             X_adj, exposure_binary, time_months, events,
-            tau=FIXED_TAU_MONTHS, random_seed=random_seed,
+            tau=effective_tau, random_seed=random_seed,
         )
         cate = causal_cate_summary(X_adj, exposure_binary, outcome_time, random_seed)
         W_arr = X_adj.to_numpy(dtype=float)

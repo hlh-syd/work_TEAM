@@ -30,5 +30,12 @@
     "cv_folds": 5,
     "primary_metric": "uno_c_index",
     "clinical_anchor_weight": 0.4
+  },
+  "imputation": {
+    "method": "missforest",
+    "clinical_n_estimators": 50,
+    "clinical_max_iter": 10,
+    "genomic_strategy": "median",
+    "min_nonmissing": 0.7
   }
 }

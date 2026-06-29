@@ -27,6 +27,13 @@ import pandas as pd
 from scipy import stats
 from scipy.stats import rankdata
 
+try:
+    from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+    from sklearn.impute import IterativeImputer
+    HAS_ITERATIVE_IMPUTER = True
+except ImportError:
+    HAS_ITERATIVE_IMPUTER = False
+
 # ──────────────────────────────────────────────────────────────────────
 # 1. PATH CONSTANTS
 # ──────────────────────────────────────────────────────────────────────
@@ -504,6 +511,160 @@ def stratified_split_keys(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# 10. IMPUTATION UTILITIES
+# ──────────────────────────────────────────────────────────────────────
+
+# 临床变量前缀：用于 TieredImputer 自动识别低维临床列
+CLINICAL_FEATURE_PREFIXES = (
+    "AGE", "SEX", "GENDER", "AJCC", "STAGE", "TUMOR", "T_",
+    "LYMPH", "N_", "METAST", "M_", "GRADE", "HISTOLOGY",
+    "RACE", "ETHNICITY", "BMI", "MSI", "CIMP", "KRAS", "BRAF", "NRAS",
+    "TMB", "TUMOR_MUTATIONAL", "SURVIVAL_GAN", "GAN_SYNTHETIC",
+    "rna_embedding", "mutation_embedding", "cnv_embedding",
+    "methylation_embedding", "rppa_embedding",
+    "clinical_", "CNV_",
+)
+
+
+def is_clinical_feature(col: str) -> bool:
+    """判断列名是否为低维临床/非基因组特征。"""
+    return any(col.startswith(p) for p in CLINICAL_FEATURE_PREFIXES)
+
+
+class TieredImputer:
+    """分层插补器：临床变量用 missForest/MICE，基因表达用中位数。
+
+    设计原则：
+    - fit() 仅在训练集上调用，杜绝数据泄漏
+    - 低维临床变量（<50列）使用 IterativeImputer (missForest/MICE)
+    - 高维基因组学特征使用中位数插补（计算高效、p>>n 安全）
+    - 兼容 sklearn Pipeline 接口 (fit/transform/fit_transform)
+    - 支持 joblib 序列化
+
+    Parameters
+    ----------
+    clinical_cols : list[str] or None
+        低维临床变量列名。若为 None，则通过 is_clinical_feature() 自动识别。
+    method : str
+        临床变量插补方法: 'missforest' | 'mice' | 'median'
+    n_estimators : int
+        missForest 随机森林的树数量（默认 50）
+    max_iter : int
+        IterativeImputer 最大迭代轮数（默认 10）
+    random_state : int
+        随机种子
+    """
+
+    def __init__(
+        self,
+        clinical_cols: Optional[List[str]] = None,
+        method: str = "missforest",
+        n_estimators: int = 50,
+        max_iter: int = 10,
+        random_state: int = 42,
+    ):
+        self.clinical_cols = clinical_cols
+        self.method = method
+        self.n_estimators = n_estimators
+        self.max_iter = max_iter
+        self.random_state = random_state
+        # 内部状态（fit 后填充）
+        self._clinical_imputer = None
+        self._genomic_imputer = None
+        self._clin_cols_fit: List[str] = []
+        self._genomic_cols_fit: List[str] = []
+
+    def _resolve_clinical_cols(self, columns) -> List[str]:
+        """解析临床列：优先使用显式指定，否则自动识别。"""
+        if self.clinical_cols is not None:
+            return [c for c in self.clinical_cols if c in columns]
+        return [c for c in columns if is_clinical_feature(c)]
+
+    def _build_clinical_imputer(self):
+        """根据 method 参数构建临床变量插补器。"""
+        if not HAS_ITERATIVE_IMPUTER or self.method == "median":
+            from sklearn.impute import SimpleImputer
+            return SimpleImputer(strategy="median")
+
+        if self.method == "missforest":
+            from sklearn.ensemble import RandomForestRegressor
+            return IterativeImputer(
+                estimator=RandomForestRegressor(
+                    n_estimators=self.n_estimators,
+                    max_features="sqrt",
+                    random_state=self.random_state,
+                    n_jobs=-1,
+                ),
+                max_iter=self.max_iter,
+                random_state=self.random_state,
+                sample_posterior=False,
+            )
+        elif self.method == "mice":
+            return IterativeImputer(
+                max_iter=self.max_iter,
+                random_state=self.random_state,
+                sample_posterior=True,
+            )
+        else:
+            from sklearn.impute import SimpleImputer
+            return SimpleImputer(strategy="median")
+
+    def fit(self, X_train: pd.DataFrame) -> "TieredImputer":
+        """仅在训练集上拟合插补器（防数据泄漏的关键）。"""
+        clin = self._resolve_clinical_cols(X_train.columns)
+        genomic = [c for c in X_train.columns if c not in clin]
+
+        if clin:
+            self._clinical_imputer = self._build_clinical_imputer()
+            self._clinical_imputer.fit(X_train[clin])
+        self._clin_cols_fit = clin
+
+        from sklearn.impute import SimpleImputer
+        self._genomic_imputer = SimpleImputer(strategy="median")
+        if genomic:
+            self._genomic_imputer.fit(X_train[genomic])
+        self._genomic_cols_fit = genomic
+
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """应用已拟合的插补器（不修改拟合参数）。"""
+        result = X.copy()
+
+        if self._clinical_imputer is not None and self._clin_cols_fit:
+            cols = [c for c in self._clin_cols_fit if c in X.columns]
+            if cols:
+                result[cols] = self._clinical_imputer.transform(X[cols])
+
+        if self._genomic_imputer is not None and self._genomic_cols_fit:
+            cols = [c for c in self._genomic_cols_fit if c in X.columns]
+            if cols:
+                result[cols] = self._genomic_imputer.transform(X[cols])
+
+        return result
+
+    def fit_transform(self, X_train: pd.DataFrame) -> pd.DataFrame:
+        """拟合并变换（仅用于训练集）。"""
+        return self.fit(X_train).transform(X_train)
+
+    def get_params(self, deep=True):
+        """sklearn 兼容接口。"""
+        return {
+            "clinical_cols": self.clinical_cols,
+            "method": self.method,
+            "n_estimators": self.n_estimators,
+            "max_iter": self.max_iter,
+            "random_state": self.random_state,
+        }
+
+    def set_params(self, **params):
+        """sklearn 兼容接口。"""
+        for k, v in params.items():
+            setattr(self, k, v)
+        return self
+
+
+# ──────────────────────────────────────────────────────────────────────
 # 8. LOGGING
 # ──────────────────────────────────────────────────────────────────────
 def setup_logger(
@@ -616,6 +777,13 @@ def _default_config() -> Dict[str, Any]:
             "cv_folds": 5,
             "primary_metric": "uno_c_index",
             "clinical_anchor_weight": 0.4,
+        },
+        "imputation": {
+            "method": "missforest",
+            "clinical_n_estimators": 50,
+            "clinical_max_iter": 10,
+            "genomic_strategy": "median",
+            "min_nonmissing": 0.7,
         },
     }
 

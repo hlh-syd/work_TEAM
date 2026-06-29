@@ -75,6 +75,7 @@ from shared_utils import (
     make_surv_array, safe_read_tsv, patient_id_from_sample,
     add_fixed_endpoint, compute_ipcw_weights, compute_pseudo_observations,
     normalize_patient_id, detect_event_time_columns, coerce_event,
+    TieredImputer, load_pipeline_config,
 )
 logger = setup_logger("03_model_training")
 
@@ -458,7 +459,15 @@ def metric_uno_and_td_auc(split, risk, horizons_months=(12.0, 36.0, 60.0), survi
     out = {}
     tau = float(np.max(valid_time))  # fallback default
     try:
-        tau = float(np.percentile(valid_time[valid_event], 90)) if valid_event.any() else float(np.max(valid_time))
+        # P1-6 fix: 使用训练集 (而非验证集) events 的 P90 作为 tau
+        # 训练集样本量更大, P90 估计更稳定
+        # Ref: Uno H et al. (2011) Stat Med 30(20):2471-84
+        _train_event_times = split.loc[train_mask, "time_months"].astype(float)
+        _train_events = split.loc[train_mask, "event"].astype(bool)
+        if _train_events.any():
+            tau = float(np.percentile(_train_event_times[_train_events], 90))
+        else:
+            tau = float(np.max(valid_time))
         uno_c, *_ = concordance_index_ipcw(y_train, y_valid, risk_valid, tau=tau)
         out["uno_c_index"] = float(uno_c)
         out["uno_tau_months"] = tau
@@ -498,7 +507,8 @@ def metric_uno_and_td_auc(split, risk, horizons_months=(12.0, 36.0, 60.0), survi
             survs = 1.0 - (rank + 1) / (len(rank) + 1)
             survs = np.tile(survs.reshape(-1, 1), (1, len(safe_horizons)))
             _, ibs = brier_score(y_train, y_valid, survs, np.asarray(safe_horizons))
-            out["risk_ranked_brier_score_exploratory"] = float(np.mean(ibs))
+            # P2-1 fix: 重命名以消除歧义——此为排序判别指标, 非校准度量
+            out["rank_discrimination_proxy"] = float(np.mean(ibs))
             if "brier_score_source" not in out:
                 out["brier_score_source"] = "risk_ranked_survival_proxy"
         except Exception:
@@ -534,31 +544,50 @@ def fit_lifelines_cox(x, split, penalizer=1.0):
 
     penalizer 默认 1.0（Ridge 正则化），防止 AJCC 分期等稀有类别
     变量引起完全分离 (ConvergenceWarning: complete separation)。
-    若首次拟合仍不收敛，自动以 2x penalizer 重试。
+
+    P1-1 fix: 指数退避重试策略，与 04_multi_timepoint.py L300 保持一致。
+    依次尝试 [penalizer, 2x, 4x, 8x]，直到收敛或耗尽所有选项。
     """
     train_mask = split["split"].to_numpy() == "train"
     train = x.iloc[train_mask].copy()
     train["time"] = split.loc[train_mask, "time_months"].to_numpy()
     train["event"] = split.loc[train_mask, "event"].astype(int).to_numpy()
-    cph = CoxPHFitter(penalizer=penalizer)
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        cph.fit(train, duration_col="time", event_col="event")
-        convergence_issues = [
-            wi for wi in w
-            if "complete separation" in str(wi.message).lower()
-            or "convergence" in str(wi.message).lower()
-        ]
-    if convergence_issues:
-        logger.warning(f"[CoxPH] Convergence issue detected (penalizer={penalizer}), retrying with {penalizer*2}")
-        cph = CoxPHFitter(penalizer=penalizer * 2)
-        cph.fit(train, duration_col="time", event_col="event")
-        penalizer = penalizer * 2
+
+    # P1-1 fix: 指数退避重试，与 04_multi_timepoint.py L300 保持一致
+    penalizer_schedule = [penalizer, penalizer * 2, penalizer * 4, penalizer * 8]
+    cph = None
+    final_penalizer = penalizer
+    for attempt, pen in enumerate(penalizer_schedule):
+        cph_try = CoxPHFitter(penalizer=pen)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            cph_try.fit(train, duration_col="time", event_col="event")
+            convergence_issues = [
+                wi for wi in w
+                if "complete separation" in str(wi.message).lower()
+                or "convergence" in str(wi.message).lower()
+            ]
+        if not convergence_issues:
+            cph = cph_try
+            final_penalizer = pen
+            break
+        if attempt < len(penalizer_schedule) - 1:
+            logger.warning(
+                f"[CoxPH] Convergence issue (penalizer={pen}), "
+                f"retrying with {penalizer_schedule[attempt + 1]}"
+            )
+        else:
+            logger.warning(
+                f"[CoxPH] All penalizers exhausted, using last attempt (penalizer={pen})"
+            )
+            cph = cph_try
+            final_penalizer = pen
+
     risk_all = lifelines_predict_log_hazard(cph, x)
     bundle = {
         "model": cph, "model_type": "lifelines_cox",
         "feature_columns": x.columns.tolist(),
-        "penalizer": penalizer, "fit_scope": "train_split_only",
+        "penalizer": final_penalizer, "fit_scope": "train_split_only",
     }
     return cph, bundle, risk_all
 
@@ -572,7 +601,13 @@ def fit_coxnet_with_cv(feature_matrix, split, feature_columns, l1_ratio=0.5, n_f
     aligned = aligned[feature_columns]
     aligned_harm = aligned.apply(rank_inverse_normal, axis=0)
     imputer = SimpleImputer(strategy="median")
-    x_all_raw = imputer.fit_transform(aligned_harm)
+    # ✅ 数据泄漏修复：仅在训练集上 fit，再 transform 验证集
+    x_train_raw = imputer.fit_transform(aligned_harm.iloc[train_mask])
+    x_all_raw = np.empty_like(aligned_harm.values, dtype=float)
+    x_all_raw[train_mask] = x_train_raw
+    val_mask = ~train_mask
+    if val_mask.any():
+        x_all_raw[val_mask] = imputer.transform(aligned_harm.iloc[val_mask])
     scaler = StandardScaler()
     scaler.fit(x_all_raw[train_mask])
     x_all = scaler.transform(x_all_raw)
@@ -737,7 +772,11 @@ def fit_xgb_cox(x, split, seed=RANDOM_SEED):
         n_jobs=-1,
         verbosity=0,
     )
-    model.fit(X_train, y_xgb)
+    # P2-3 fix: 添加 early stopping 防止过拟合
+    # Ref: Chen & Guestrin (2016) KDD
+    from sklearn.model_selection import train_test_split as _xgb_tts
+    X_tr, X_eval, y_tr, y_eval = _xgb_tts(X_train, y_xgb, test_size=0.15, random_state=seed)
+    model.fit(X_tr, y_tr, eval_set=[(X_eval, y_eval)], early_stopping_rounds=20, verbose=False)
 
     # 风险分数 = exp(margin)，clip 防止指数溢出
     raw_pred = model.predict(X_all)
@@ -798,6 +837,28 @@ def fit_gbsa(x, split, seed=RANDOM_SEED):
         "fit_scope": "train_split_only",
     }
     return model, bundle, risk_all
+
+
+def _rank_normalize_2d(arr):
+    """P1-3 fix: 对 2D 数组逐列做 rank-normalize 到 [0,1]。
+
+    各基模型输出尺度不同 (log-hazard, linear predictor, ensemble risk, exp-risk),
+    rank-normalize 使 meta-learner 的 L2 正则化对各基模型惩罚均匀。
+    Ref: van der Laan et al. (2007) Stat Appl Genet Mol Biol 6:Article 25;
+         Naimi & Balzer (2018) Eur J Epidemiol 33:459-464.
+    """
+    from scipy.stats import rankdata
+    out = np.zeros_like(arr, dtype=float)
+    for j in range(arr.shape[1]):
+        col = arr[:, j]
+        valid = np.isfinite(col)
+        if valid.sum() < 2:
+            out[:, j] = 0.5
+            continue
+        r = rankdata(col[valid], method="average")
+        out[valid, j] = (r - 0.5) / valid.sum()
+        out[~valid, j] = 0.5
+    return out
 
 
 def fit_super_learner(x, split, seed=RANDOM_SEED):
@@ -902,12 +963,19 @@ def fit_super_learner(x, split, seed=RANDOM_SEED):
                     cv_predictions[val_idx, i] = m.predict(X_fold_val)
                 elif name == "xgb_cox":
                     y_xgb = np.where(fold_event == 1, fold_time, -fold_time)
-                    m.fit(X_fold_tr, y_xgb)
+                    # P2-3 fix: Super Learner CV 中 XGB 也使用 early stopping
+                    _n_eval = max(2, int(len(X_fold_tr) * 0.15))
+                    m.fit(X_fold_tr[:-_n_eval], y_xgb[:-_n_eval],
+                          eval_set=[(X_fold_tr[-_n_eval:], y_xgb[-_n_eval:])],
+                          early_stopping_rounds=20, verbose=False)
                     raw = m.predict(X_fold_val)
                     cv_predictions[val_idx, i] = np.exp(np.clip(raw, -30, 30))
             except Exception as e:
                 logger.info(f"  [Super Learner] {name} fold {fold_idx} failed: {e}")
                 cv_predictions[val_idx, i] = 0.0
+
+    # P1-3 fix: 对 CV 预测做 rank-normalize, 统一基模型尺度
+    cv_predictions = _rank_normalize_2d(cv_predictions)
 
     # ---------- 元学习器 ----------
     # L2 正则化 (C=0.5) 防止元学习器过拟合 + class_weight 平衡事件比例
@@ -933,7 +1001,11 @@ def fit_super_learner(x, split, seed=RANDOM_SEED):
                 final_models[name] = m
             elif name == "xgb_cox":
                 y_xgb = np.where(y_event_train == 1, y_time_train, -y_time_train)
-                m.fit(X_train, y_xgb)                     # X_train 非 X_all
+                # P2-3 fix: Super Learner 最终训练也使用 early stopping
+                _n_eval = max(2, int(len(X_train) * 0.15))
+                m.fit(X_train[:-_n_eval], y_xgb[:-_n_eval],
+                      eval_set=[(X_train[-_n_eval:], y_xgb[-_n_eval:])],
+                      early_stopping_rounds=20, verbose=False)  # X_train 非 X_all
                 final_models[name] = m
         except Exception as e:
             logger.info(f"  [Super Learner] full-data training {name} failed: {e}")
@@ -980,6 +1052,8 @@ def _predict_super_learner_risk(meta_learner, base_models, learner_names, x, X_a
             base_preds[:, i] = 0.0
     # 清理 inf/nan 后再交给 meta-learner
     base_preds = np.nan_to_num(base_preds, nan=0.0, posinf=1e10, neginf=-1e10)
+    # P1-3 fix: 对基模型预测做 rank-normalize, 与 CV 阶段保持一致
+    base_preds = _rank_normalize_2d(base_preds)
     return meta_learner.predict_proba(base_preds)[:, 1]
 
 
@@ -993,14 +1067,23 @@ def select_primary_model(metric_df, policy="survival_composite"):
     candidates["internal_c_index"] = pd.to_numeric(candidates["observed_value"], errors="coerce")
     candidates["td_auc_mean"] = pd.to_numeric(candidates.get("td_auc_mean", np.nan), errors="coerce")
     ibs = pd.to_numeric(candidates.get("integrated_brier_score", np.nan), errors="coerce")
-    exploratory_brier = pd.to_numeric(candidates.get("risk_ranked_brier_score_exploratory", np.nan), errors="coerce")
+    # P2-1 fix: 兼容新名称和旧名称
+    exploratory_brier = pd.to_numeric(
+        candidates.get("rank_discrimination_proxy",
+                       candidates.get("risk_ranked_brier_score_exploratory", np.nan)),
+        errors="coerce"
+    )
     calibration_loss = ibs.combine_first(exploratory_brier)
     candidates["negative_brier"] = -calibration_loss
     candidates["parsimony_score"] = 0.5
     candidates.loc[candidates["model_key"].str.match(r"^clinical_(ajcc|tnm|minimal|random)", case=False, na=False), "parsimony_score"] = 1.0
     candidates.loc[candidates["model_key"].str.contains("coxnet", case=False, na=False), "parsimony_score"] = 0.8
     candidates["td_auc_filled"] = candidates["td_auc_mean"].fillna(candidates["internal_c_index"])
-    candidates["neg_brier_filled"] = candidates["negative_brier"].fillna(0.0)
+    # P1-4 fix: 填最差值而非最优值 (0.0 = 完美校准), 缺失 Brier 不应获得选择优势
+    _worst_brier = candidates["negative_brier"].min()
+    candidates["neg_brier_filled"] = candidates["negative_brier"].fillna(
+        _worst_brier if np.isfinite(_worst_brier) else -1.0
+    )
     candidates["selection_score"] = (
         0.55 * candidates["internal_c_index"].fillna(0.0)
         + 0.25 * candidates["td_auc_filled"]
@@ -1220,6 +1303,11 @@ class ConditionalTabularGAN:
             generator.load_state_dict(best_state)
         self.generator = generator
         self.status = "fitted"
+        # P2-2 fix: 释放 GPU 内存，防止后续模型 OOM
+        if HAS_TORCH and torch.cuda.is_available():
+            del generator, discriminator, opt_g, opt_d, scheduler_g, scheduler_d
+            torch.cuda.empty_cache()
+        import gc; gc.collect()
         return self
 
     def sample(self, n, condition_values):
@@ -1358,6 +1446,11 @@ class SurvivalConditionalTabularGAN(ConditionalTabularGAN):
             generator.load_state_dict(best_state["generator"])
         self.generator = generator
         self.status = "fitted"
+        # P2-2 fix: 释放 GPU 内存，防止后续模型 OOM
+        if HAS_TORCH and torch.cuda.is_available():
+            del generator, discriminator, opt_g, opt_d, scheduler_g, scheduler_d
+            torch.cuda.empty_cache()
+        import gc; gc.collect()
         return self
 
     def sample(self, n, condition_values):
@@ -1433,11 +1526,15 @@ def synthetic_data_qc(X_real, X_syn, X_holdout=None, random_seed=RANDOM_SEED, mi
     pca_var_corr = 0.0
     try:
         if n_pca >= 2:
+            # P2-4 fix: 在联合数据上 fit 统一 PCA，比较 real 和 syn 投影后的方差分布
             pca_unified = PCA(n_components=n_pca, random_state=random_seed)
-            pca_proj_r = pca_unified.fit_transform(X_r_sc)
-            pca_s = PCA(n_components=n_pca, random_state=random_seed)
-            pca_s.fit(X_s_sc)
-            pca_var_corr = float(np.corrcoef(pca_unified.explained_variance_ratio_, pca_s.explained_variance_ratio_)[0, 1])
+            X_combined = np.vstack([X_r_sc, X_s_sc])
+            pca_unified.fit(X_combined)
+            proj_r = pca_unified.transform(X_r_sc)
+            proj_s = pca_unified.transform(X_s_sc)
+            var_r = np.var(proj_r, axis=0)
+            var_s = np.var(proj_s, axis=0)
+            pca_var_corr = float(np.corrcoef(var_r, var_s)[0, 1])
             if not np.isfinite(pca_var_corr):
                 pca_var_corr = 0.0
     except Exception:
@@ -1572,6 +1669,8 @@ def train_only_gan_augmentation(X_train, endpoint_train, train_ids, gan_epochs, 
             if syn.empty:
                 continue
             syn_event = cond_rows["death_by_36m"].round().astype(int).to_numpy()
+            # P0-3 fix: 从条件向量的 log1p_time_months 反推合成样本生存时间
+            syn_time = np.expm1(cond_rows["log1p_time_months"].to_numpy()).clip(lower=0.0)
             real_event = y_obs.reindex(train_ids).to_numpy()
             syn_calibrated = _moment_match_calibrate(syn, X_train.loc[train_ids], syn_event == 1, real_event)
             qc = synthetic_data_qc(X_train.loc[train_ids], syn_calibrated, X_holdout, random_seed=seed)
@@ -1579,6 +1678,7 @@ def train_only_gan_augmentation(X_train, endpoint_train, train_ids, gan_epochs, 
             result = {
                 "strategy": strategy, "ratio": ratio, "n_syn": n_syn,
                 "qc": qc, "X_aug": X_aug, "gan": gan,
+                "syn_event": syn_event, "syn_time": syn_time,
             }
             if best_result is None or (qc["good_count"] > best_result["qc"]["good_count"]):
                 best_result = result
@@ -1645,6 +1745,12 @@ def plot_calibration_curve(time, event, risk, cohort, model_name, fig_dir, n_gro
     time, event, risk = time[valid], event[valid], risk[valid]
     if len(time) < 10:
         return []
+    # P0-4 fix: 将风险分数转为 [0,1] 概率 (rank-based probability transform)
+    # 保持排序不变, 使 X 轴与 Y 轴 (KM 事件率) 在同一尺度
+    # Ref: Van Calster et al. (2019) BMC Medicine 17:230
+    from scipy.stats import rankdata as _rankdata
+    _ranks = _rankdata(risk, method="average")
+    risk = (_ranks - 0.5) / len(_ranks)  # uniform [0,1]
     order = np.argsort(risk)
     groups = np.array_split(order, n_groups)
     obs_rates, pred_scores = [], []
@@ -1669,10 +1775,11 @@ def plot_calibration_curve(time, event, risk, cohort, model_name, fig_dir, n_gro
     ax.scatter(pred_scores, obs_rates, s=40, zorder=5, color="#1f77b4")
     if len(obs_rates) >= 2:
         from numpy.polynomial import polynomial as P
-        coeffs = np.polyfit(pred_scores, obs_rates, deg=min(2, len(obs_rates) - 1))
-        poly_fn = np.poly1d(coeffs)
+        _deg = min(2, len(obs_rates) - 1)
+        # P2-6 fix: 使用 numpy.polynomial.polynomial 替代 np.polyfit, 数值稳定性更优
+        coeffs = P.polyfit(pred_scores, obs_rates, deg=_deg)
         xs = np.linspace(pred_scores.min(), pred_scores.max(), 50)
-        ax.plot(xs, poly_fn(xs), color="#1f77b4", linewidth=1.2, label="fitted")
+        ax.plot(xs, P.polyval(xs, coeffs), color="#1f77b4", linewidth=1.2, label="fitted")
     lo, hi = min(pred_scores.min(), obs_rates.min()), max(pred_scores.max(), obs_rates.max())
     ax.plot([lo, hi], [lo, hi], "k--", linewidth=0.8, label="ideal")
     ax.set_xlabel("Predicted risk (mean risk score)")
@@ -1737,6 +1844,21 @@ def plot_km_risk_strata(time, event, risk, cohort, model_name, fig_dir, cut="med
 
 
 def decision_curve_analysis(time, event, risk, horizon_months, thresholds):
+    """生存数据决策曲线分析 (Decision Curve Analysis)。
+
+    基于 Vickers and Elkin (2006) Med Decis Making 26(6):565-74 和
+    Vickers et al. (2008) BMC Med Inform Decis Mak 8:53 的 KM-based 方法。
+
+    概率校准回退链:
+      1. CoxPH + Breslow 基线风险 (指数退避重试, penalizer 0.5->4.0)
+      2. Isotonic Regression + KM 分组事件率作为校准目标
+      3. KM 分位数组线性插值 (最终兜底)
+
+    注意: 在 KM-based net benefit 计算中, prob_event 仅用于阈值分组
+    (treated = prob_event >= pt), 实际事件率由 KM 估计计算。因此任何
+    保持风险排序的单调变换都产生相同的 DCA 曲线形状。
+    参考: dcurves R 包 (Sjoberg 2024) as_probability 文档。
+    """
     time = np.asarray(time, dtype=float)
     event = np.asarray(event, dtype=int)
     risk = np.asarray(risk, dtype=float)
@@ -1750,38 +1872,98 @@ def decision_curve_analysis(time, event, risk, horizon_months, thresholds):
         cal_df["_r"] = (risk - risk.mean()) / risk_std
     else:
         cal_df["_r"] = 0.0
-    # 方案 C: 先将 risk 标准化到 [0,1] 再拟合 CoxPH，改善收敛
+    # 将 risk 标准化到 [0,1] 再拟合 CoxPH，改善收敛
     risk_min, risk_max = risk.min(), risk.max()
     if risk_max - risk_min > 1e-8:
         risk_norm = (risk - risk_min) / (risk_max - risk_min)
     else:
         risk_norm = np.full(n, 0.5)
     cal_df["_r_norm"] = risk_norm
-    try:
-        cph = CoxPHFitter(penalizer=0.5)  # 增大正则化提升稳定性
-        cph.fit(cal_df[["_r_norm", "_t", "_e"]], duration_col="_t", event_col="_e")
-        breslow = cph.baseline_cumulative_hazard_
-        h0_col = breslow.iloc[(breslow.index - horizon_months).abs().argmin()]
-        ph = cph.predict_partial_hazard(cal_df[["_r_norm"]]).to_numpy().ravel()
-        H_ind = np.clip(h0_col * ph, 0, 30)
-        prob_event = np.clip(1.0 - np.exp(-H_ind), 0.0, 0.999)
-    except Exception:
-        # 回退: isotonic regression 校准 (保留单调性，优于纯秩次)
-        logger.info("DCA: Cox calibration failed; using isotonic regression proxy.")
+    # ── 回退层 1: CoxPH + Breslow (指数退避重试) ──────────────────
+    # 参照 dcurves 包 (Sjoberg 2024): Cox PH + Breslow 基线累积风险 → 绝对概率
+    prob_event = None
+    for _pen in [0.5, 1.0, 2.0, 4.0]:
+        try:
+            cph = CoxPHFitter(penalizer=_pen)
+            with warnings.catch_warnings(record=True) as _w:
+                warnings.simplefilter("always")
+                cph.fit(cal_df[["_r_norm", "_t", "_e"]], duration_col="_t", event_col="_e")
+                _conv = [wi for wi in _w
+                         if "convergence" in str(wi.message).lower()
+                         or "complete separation" in str(wi.message).lower()]
+            if _conv:
+                continue
+            _coefs = cph.params_.to_numpy()
+            if not np.all(np.isfinite(_coefs)):
+                continue
+            breslow = cph.baseline_cumulative_hazard_
+            h0_col = breslow.iloc[(breslow.index - horizon_months).abs().argmin()]
+            ph = cph.predict_partial_hazard(cal_df[["_r_norm"]]).to_numpy().ravel()
+            H_ind = np.clip(h0_col * ph, 0, 30)
+            prob_event = np.clip(1.0 - np.exp(-H_ind), 0.0, 0.999)
+            break
+        except Exception:
+            continue
+    # ── 回退层 2: Isotonic Regression + KM 分组事件率 ─────────────
+    # 复用 plot_calibration_curve 的 KM 分组模式 (Van Calster 2018, Eur Urol)
+    if prob_event is None:
+        logger.info("DCA: Cox calibration failed; using KM-group isotonic regression.")
         try:
             from sklearn.isotonic import IsotonicRegression
-            ir = IsotonicRegression(out_of_bounds="clip")
-            # 以 KM 估计的经验事件率作为校准目标
-            kmf_cal = KaplanMeierFitter().fit(time, event)
-            try:
-                overall_rate = 1.0 - float(kmf_cal.predict(horizon_months))
-            except Exception:
-                overall_rate = float(event.mean())
-            ranks = pd.Series(risk).rank(method="average", pct=True).to_numpy()
-            ir.fit(ranks, np.where(risk >= np.median(risk), overall_rate * 1.5, overall_rate * 0.5))
-            prob_event = ir.predict(ranks).clip(0.001, 0.999)
+            K = max(3, min(10, n // 5))
+            order = np.argsort(risk)
+            groups = np.array_split(order, K)
+            group_risks, group_rates = [], []
+            for g in groups:
+                if len(g) < 2:
+                    continue
+                kmf_g = KaplanMeierFitter().fit(time[g], event[g])
+                try:
+                    surv_g = float(kmf_g.predict(horizon_months))
+                except Exception:
+                    surv_g = 1.0 - float(event[g].mean())
+                group_risks.append(float(np.mean(risk[g])))
+                group_rates.append(1.0 - surv_g)
+            group_risks = np.array(group_risks)
+            group_rates = np.array(group_rates)
+            if len(group_risks) >= 2:
+                ir = IsotonicRegression(out_of_bounds="clip")
+                ir.fit(group_risks, group_rates)
+                prob_event = ir.predict(risk).clip(0.001, 0.999)
+            else:
+                prob_event = None
         except Exception:
+            prob_event = None
+    # ── 回退层 3: KM 分位数组线性插值 (最终兜底) ─────────────
+    # Vickers 2008: prob_event 仅用于阈值分组，此处提供校准概率估计
+    if prob_event is None:
+        logger.info("DCA: All calibration failed; using KM-quantile interpolation proxy.")
+        K = max(3, min(5, n // 5))
+        order = np.argsort(risk)
+        groups = np.array_split(order, K)
+        group_risks, group_rates = [], []
+        for g in groups:
+            if len(g) < 2:
+                continue
+            kmf_g = KaplanMeierFitter().fit(time[g], event[g])
+            try:
+                surv_g = float(kmf_g.predict(horizon_months))
+            except Exception:
+                surv_g = 1.0 - float(event[g].mean())
+            group_risks.append(float(np.mean(risk[g])))
+            group_rates.append(1.0 - surv_g)
+        if len(group_risks) >= 2:
+            group_risks = np.array(group_risks)
+            group_rates = np.array(group_rates)
+            sort_idx = np.argsort(group_risks)
+            prob_event = np.interp(risk, group_risks[sort_idx], group_rates[sort_idx])
+            prob_event = np.clip(prob_event, 0.001, 0.999)
+        else:
             prob_event = (risk.argsort().argsort() + 1.0) / (n + 1)
+
+    # ── KM-based Net Benefit 计算 ───────────────────────────────
+    # Vickers 2008: TP=[1-S(t|x=1)]*P(x=1)*n, FP=S(t|x=1)*P(x=1)*n
+    # prob_event 仅用于分组，实际事件率由 KM 估计计算
     kmf_all = KaplanMeierFitter().fit(time, event)
     try:
         surv_all = float(kmf_all.predict(horizon_months))
@@ -1808,6 +1990,7 @@ def decision_curve_analysis(time, event, risk, horizon_months, thresholds):
                      "net_benefit_treat_all": float(nb_all), "net_benefit_treat_none": 0.0,
                      "n_treated": n_treated})
     return pd.DataFrame(rows)
+
 
 
 def plot_dca(dca_df, cohort, model_name, fig_dir):
@@ -2129,9 +2312,19 @@ def main():
     else:
         X_all = pd.DataFrame(index=patients)
 
-    imp = SimpleImputer(strategy="median")
-    X_all_imp = pd.DataFrame(imp.fit_transform(X_all), columns=X_all.columns, index=X_all.index)
-    logger.info(f"[03] Feature matrix: {X_all_imp.shape}")
+    # ✅ 数据泄漏修复：分层插补 + 仅在训练集上 fit
+    config = load_pipeline_config()
+    imp_cfg = config.get("imputation", {})
+    imp = TieredImputer(
+        method=imp_cfg.get("method", "missforest"),
+        n_estimators=imp_cfg.get("clinical_n_estimators", 50),
+        max_iter=imp_cfg.get("clinical_max_iter", 10),
+        random_state=RANDOM_SEED,
+    )
+    train_idx = X_all.index.isin(train_ids)
+    imp.fit(X_all.loc[train_idx])
+    X_all_imp = pd.DataFrame(imp.transform(X_all), columns=X_all.columns, index=X_all.index)
+    logger.info(f"[03] Feature matrix: {X_all_imp.shape} (imputation: {imp_cfg.get('method', 'missforest')}, fit=train_only)")
 
     endpoint = clinical.set_index("PATIENT_ID")[["OS_MONTHS", "OS_EVENT"]].rename(
         columns={"OS_MONTHS": "time_months", "OS_EVENT": "event"}
@@ -2154,8 +2347,10 @@ def main():
         if gan_result is not None and gan_result.get("qc", {}).get("passed", False):
             X_aug = gan_result["X_aug"]
             n_syn = len(X_aug) - len(train_ids)
-            syn_event = np.ones(n_syn, dtype=int)
-            syn_time = np.full(n_syn, FIXED_TAU_MONTHS)
+            # P0-3 fix: 从 GAN 条件向量提取生存标签, 而非硬编码 event=1, time=36m
+            # Ref: 03审查.md P0-3 — 硬编码导致虚假 "36月死亡" 关联
+            syn_event = gan_result.get("syn_event", np.ones(n_syn, dtype=int))
+            syn_time = gan_result.get("syn_time", np.full(n_syn, FIXED_TAU_MONTHS))
             X_train_aug = pd.concat([X_all_imp.loc[X_all_imp.index.isin(train_ids)], X_aug.iloc[len(train_ids):]], ignore_index=True)
             endpoint_train_aug = pd.DataFrame({
                 "time_months": np.concatenate([endpoint_train["time_months"].values, syn_time]),
@@ -2307,7 +2502,9 @@ def main():
             time_v = split_df.loc[valid_mask, "time_months"].values.astype(float)
             event_v = split_df.loc[valid_mask, "event"].values.astype(int)
             c_idx = harrell_c_index(time_v, event_v, valid_r)
-            boot = bootstrap_harrell(time_v, event_v, valid_r, 200, RANDOM_SEED)
+            # P2-5 fix: 提升 bootstrap 次数至 1000, 减小 CI Monte Carlo 误差 (~3%)
+            # Ref: Efron & Tibshirani (1993) An Introduction to the Bootstrap, p.182
+            boot = bootstrap_harrell(time_v, event_v, valid_r, 1000, RANDOM_SEED)
             uno_metrics = metric_uno_and_td_auc(
                 split_df, r, horizons_months=(12.0, 36.0),
                 survival_estimator=lifelines_survival_estimator(trained_models[model_name], X_valid) if model_name == "cox_ph" else (sksurv_survival_estimator(trained_models[model_name], X_valid.values) if model_name in ("gbsa", "rsf") else None),
@@ -2352,7 +2549,11 @@ def main():
             plot_calibration_curve(valid_time_arr, valid_event_arr, valid_r, "tcga_internal", model_name, fig_dir)
             plot_km_risk_strata(valid_time_arr, valid_event_arr, valid_r, "tcga_internal", model_name, fig_dir)
             dca_thr = np.arange(0.05, 0.51, 0.01)
-            dca_df = decision_curve_analysis(valid_time_arr, valid_event_arr, valid_r, horizon_months=60.0, thresholds=dca_thr)
+            # P1-5 fix: 动态 horizon, 防止超出随访范围导致 KM 尾部不稳定
+            _dyn_horizon = min(60.0, float(np.percentile(
+                valid_time_arr[valid_event_arr.astype(bool)], 90
+            ))) if valid_event_arr.sum() > 0 else 60.0
+            dca_df = decision_curve_analysis(valid_time_arr, valid_event_arr, valid_r, horizon_months=_dyn_horizon, thresholds=dca_thr)
             if not dca_df.empty:
                 plot_dca(dca_df, "tcga_internal", model_name, fig_dir)
         except Exception as e:
@@ -2448,6 +2649,8 @@ def main():
         "external_cohorts_used_post_lock_only": False,
         "external_validation": "skipped_internal_only_mode",
         "feature_selection_scope": "train_split_only",
+        "imputation_scope": "train_only",
+        "imputation_method": imp.method,
         "split_source": str(split_path),
         "n_train": int(train_mask.sum()),
         "n_validation": int(valid_mask.sum()),

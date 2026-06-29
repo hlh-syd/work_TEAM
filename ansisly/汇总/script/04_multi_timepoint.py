@@ -70,7 +70,7 @@ from shared_utils import (
     kaplan_meier_survival_at, km_cumulative_incidence_by_tau,
     detect_event_time_columns, coerce_event,
     add_fixed_endpoint, compute_ipcw_weights, compute_pseudo_observations,
-    rank_inverse_normal,
+    rank_inverse_normal, stage_to_group,
 )
 logger = setup_logger("04_multi_timepoint")
 
@@ -278,6 +278,11 @@ def evaluate_with_cv(X_train, endpoint_train, tau_int, random_seed, n_folds=5):
 
 
 def fit_timepoint_cox(X_train, endpoint_train, penalizer=0.5):
+    """Fit Cox PH with convergence-aware retry.
+
+    P2 fix: catches convergence warnings, retries with increasing penalizer,
+    and logs detailed diagnostics instead of silently returning None.
+    """
     if CoxPHFitter is None:
         return None
     if X_train.empty or len(X_train) < 10:
@@ -290,12 +295,42 @@ def fit_timepoint_cox(X_train, endpoint_train, penalizer=0.5):
     usable = usable.loc[:, usable.var() > 1e-6]
     if "event" not in usable.columns or usable["event"].sum() < 5:
         return None
-    try:
-        model = CoxPHFitter(penalizer=penalizer)
-        model.fit(usable, duration_col="time_months", event_col="event", show_progress=False)
-        return model
-    except Exception:
-        return None
+
+    # P2 fix: penalizer 递增重试 + convergence warning 捕获
+    penalizer_schedule = [penalizer, 1.0, 2.0, 5.0, 10.0]
+    for attempt, pen in enumerate(penalizer_schedule):
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                model = CoxPHFitter(penalizer=pen)
+                model.fit(usable, duration_col="time_months", event_col="event", show_progress=False)
+                # 检查是否产生了收敛相关的 warning
+                conv_warnings = [w for w in caught if any(
+                    kw in str(w.message).lower()
+                    for kw in ["convergence", "delta", "newton", "step halving", "matrix"]
+                )]
+                if conv_warnings and attempt < len(penalizer_schedule) - 1:
+                    logger.warning(
+                        f"[04] Cox PH 收敛警告 (penalizer={pen}): "
+                        f"{[str(w.message)[:120] for w in conv_warnings[:2]]}; "
+                        f"重试 penalizer={penalizer_schedule[attempt + 1]}"
+                    )
+                    continue
+                if conv_warnings:
+                    logger.warning(
+                        f"[04] Cox PH 最终收敛警告 (penalizer={pen}): "
+                        f"{[str(w.message)[:120] for w in conv_warnings[:2]]}"
+                    )
+                return model
+        except Exception as exc:
+            if attempt < len(penalizer_schedule) - 1:
+                logger.warning(
+                    f"[04] Cox PH 拟合失败 (penalizer={pen}): {exc}; "
+                    f"重试 penalizer={penalizer_schedule[attempt + 1]}"
+                )
+            else:
+                logger.warning(f"[04] Cox PH 所有 penalizer 均失败，放弃: {exc}")
+    return None
 
 
 def fit_timepoint_coxnet(X_train, endpoint_train):
@@ -773,19 +808,24 @@ _ONEHOT_COLUMNS = {
 }
 
 
-def build_clinical_features(clinical_df):
-    """Extract numeric clinical features with RINT + OneHot + Imputer + Scaler.
+def build_clinical_features(clinical_df, train_ids=None):
+    """Extract numeric clinical features with train-only RINT + OneHot + Imputer + Scaler.
 
     Pipeline:
-      1. Continuous vars → RINT (rank inverse normal transform)
-      2. Categorical vars → OneHot encoding
-      3. Remaining numeric vars → kept as-is
-      4. SimpleImputer (median) + StandardScaler
+      1. AJCC 分期合并为 I/II/III/IV/Unknown（防止稀有分期完全分离）
+      2. Continuous vars → train-only RINT (QuantileTransformer)
+      3. Categorical vars → train-only OneHot encoding
+      4. Remaining numeric vars → kept as-is
+      5. Train-only SimpleImputer (median) + StandardScaler
+
+    Args:
+        clinical_df: raw clinical DataFrame
+        train_ids: set/list of training PATIENT_IDs. If None, fits on all (legacy).
 
     Returns a fully numeric, scaled DataFrame indexed by PATIENT_ID.
     """
     from sklearn.impute import SimpleImputer
-    from sklearn.preprocessing import StandardScaler, OneHotEncoder
+    from sklearn.preprocessing import StandardScaler, OneHotEncoder, QuantileTransformer
 
     exclude = {
         "PATIENT_ID", "OS_MONTHS", "OS_EVENT", "OS_STATUS",
@@ -798,6 +838,10 @@ def build_clinical_features(clinical_df):
     }
     work = clinical_df.copy()
     work["PATIENT_ID"] = work["PATIENT_ID"].astype(str)
+
+    # ── P2 fix: AJCC 稀有分期合并 ──
+    if "AJCC_PATHOLOGIC_TUMOR_STAGE" in work.columns:
+        work["AJCC_PATHOLOGIC_TUMOR_STAGE"] = work["AJCC_PATHOLOGIC_TUMOR_STAGE"].map(stage_to_group)
 
     # --- Step 1: Classify columns ---
     rint_cols, onehot_cols, numeric_cols = [], [], []
@@ -828,31 +872,58 @@ def build_clinical_features(clinical_df):
     if not rint_cols and not onehot_cols and not numeric_cols:
         return pd.DataFrame(index=work["PATIENT_ID"].values)
 
-    # --- Step 2: RINT on continuous columns ---
+    # Determine train mask
+    train_mask = pd.Series(True, index=work.index)
+    if train_ids is not None:
+        train_set = set(map(str, train_ids))
+        train_mask = work["PATIENT_ID"].isin(train_set)
+        if train_mask.sum() < 3:
+            logger.warning("[04] build_clinical_features: train_ids 匹配不足 3 例，回退全量 fit")
+            train_mask = pd.Series(True, index=work.index)
+
+    # --- Step 2: Train-only RINT via QuantileTransformer ---
     rint_df = pd.DataFrame(index=work.index)
     for col in rint_cols:
-        rint_df[col] = rank_inverse_normal(work[col])
+        raw = pd.to_numeric(work[col], errors="coerce")
+        train_vals = raw[train_mask].dropna().to_numpy().reshape(-1, 1)
+        if len(train_vals) < 3:
+            rint_df[col] = raw
+            continue
+        qt = QuantileTransformer(output_distribution="normal", random_state=RANDOM_SEED)
+        qt.fit(train_vals)
+        all_vals = raw.to_numpy().reshape(-1, 1)
+        valid_mask = ~np.isnan(all_vals.ravel())
+        transformed = np.full_like(all_vals.ravel(), np.nan, dtype=float)
+        if valid_mask.any():
+            transformed[valid_mask] = qt.transform(all_vals[valid_mask]).ravel()
+        rint_df[col] = transformed
 
-    # --- Step 3: OneHot on categorical columns ---
+    # --- Step 3: Train-only OneHot on categorical columns ---
     onehot_df = pd.DataFrame(index=work.index)
     if onehot_cols:
         encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore", dtype=float)
-        cat_data = work[onehot_cols].fillna("MISSING").astype(str)
-        encoded = encoder.fit_transform(cat_data)
+        cat_train = work.loc[train_mask, onehot_cols].fillna("MISSING").astype(str)
+        encoder.fit(cat_train)
+        cat_all = work[onehot_cols].fillna("MISSING").astype(str)
+        encoded = encoder.transform(cat_all)
         feature_names = encoder.get_feature_names_out(onehot_cols)
         onehot_df = pd.DataFrame(encoded, columns=feature_names, index=work.index)
 
     # --- Step 4: Remaining numeric columns ---
     numeric_df = work[numeric_cols].copy() if numeric_cols else pd.DataFrame(index=work.index)
 
-    # --- Step 5: Concatenate and scale ---
+    # --- Step 5: Concatenate and train-only scale ---
     clinical_features = pd.concat([rint_df, onehot_df, numeric_df], axis=1)
     clinical_features.index = work["PATIENT_ID"].values
 
-    # Impute + Scale
+    # Train-only Impute + Scale
     imputer = SimpleImputer(strategy="median")
     scaler = StandardScaler()
-    scaled_values = scaler.fit_transform(imputer.fit_transform(clinical_features))
+    train_feat = clinical_features.loc[train_mask.to_numpy()]
+    imputer.fit(train_feat)
+    scaler.fit(imputer.transform(train_feat))
+    imputed_all = imputer.transform(clinical_features)
+    scaled_values = scaler.transform(imputed_all)
     clinical_features = pd.DataFrame(
         scaled_values,
         columns=clinical_features.columns,
@@ -918,6 +989,7 @@ def per_endpoint_feature_screening(clinical, feature_df, train_ids, tau_months, 
                 causal_table = run_causal_screening(
                     feature_matrix_train, clin_adj, endpoint_train,
                     random_seed=random_seed, max_features=len(expression_genes),
+                    tau_months=tau_months,
                 )
                 if not causal_table.empty and "causal_priority_score" in causal_table.columns:
                     causal_genes = causal_table.sort_values("causal_priority_score", ascending=False).head(50)["feature"].tolist()
@@ -1205,12 +1277,14 @@ def load_input_data(timestamp):
 
 
 def prepare_features(clinical_ids, feature_df, train_ids, apply_rint=True):
-    """Prepare a feature matrix with train-only fit preprocessing.
+    """Prepare a feature matrix with strict train-only fit preprocessing.
 
-    Expression-like matrices use per-column RINT followed by a median imputer and
-    StandardScaler fitted on training samples only. Validation/test rows are only
-    transformed by the fitted preprocessing chain.
+    Expression-like matrices use per-column train-only QuantileTransformer (RINT)
+    followed by a median imputer and StandardScaler fitted on training samples only.
+    Validation/test rows are only transformed by the fitted preprocessing chain.
     """
+    from sklearn.preprocessing import QuantileTransformer as _QT
+
     idx = list(map(str, clinical_ids))
     if feature_df is None:
         cols = [f"f_{i}" for i in range(10)]
@@ -1230,7 +1304,24 @@ def prepare_features(clinical_ids, feature_df, train_ids, apply_rint=True):
         med = X.loc[train_idx].median() if train_idx else X.median()
         return X.fillna(med).fillna(0.0)
 
-    X_work = X.apply(rank_inverse_normal, axis=0) if apply_rint else X
+    # P1 fix: train-only RINT via QuantileTransformer (no validation leakage)
+    if apply_rint:
+        X_work = X.copy()
+        for col in X_work.columns:
+            train_vals = X_work.loc[train_idx, col].dropna().to_numpy().reshape(-1, 1)
+            if len(train_vals) < 3:
+                continue
+            qt = _QT(output_distribution="normal", random_state=RANDOM_SEED)
+            qt.fit(train_vals)
+            all_vals = X_work[col].to_numpy().reshape(-1, 1)
+            valid = ~np.isnan(all_vals.ravel())
+            if valid.any():
+                transformed = np.full(all_vals.shape[0], np.nan)
+                transformed[valid] = qt.transform(all_vals[valid]).ravel()
+                X_work[col] = transformed
+    else:
+        X_work = X
+
     fit_block = X_work.loc[train_idx]
     valid_cols = fit_block.notna().sum(axis=0) >= 1
     X_work = X_work.loc[:, valid_cols]
@@ -1281,9 +1372,14 @@ def endpoint_from_sampled_conditions(endpoint_template, sampled_conditions, syn_
         tau_col = f"death_by_{tau_int}m"
         if tau_col in syn_ep.columns:
             syn_ep[tau_col] = cond["death_by_36m"].round().clip(0, 1).astype(float).to_numpy()
-        for col in [f"death_by_{tau_int}m_observed", f"early_censored_before_{tau_int}m"]:
-            if col in syn_ep.columns:
-                syn_ep[col] = False
+        # P1 fix: 合成样本用于监督训练，标志语义必须一致
+        # observed=True 表示端点已知（来自 GAN condition），非早期删失
+        obs_col = f"death_by_{tau_int}m_observed"
+        if obs_col in syn_ep.columns:
+            syn_ep[obs_col] = True
+        cens_col = f"early_censored_before_{tau_int}m"
+        if cens_col in syn_ep.columns:
+            syn_ep[cens_col] = False
         if "ipcw_label_available" in syn_ep.columns:
             syn_ep["ipcw_label_available"] = True
         ipcw_col = f"ipcw_weight_{tau_int}m"
@@ -1655,7 +1751,7 @@ def run_fixed_timepoint(tp_name, tau_months, eval_times, timestamp, clinical, fe
     pd.DataFrame({"feature": fused_genes}).to_csv(
         os.path.join(results_base, "fused_gene_list.tsv"), sep="\t", index=False)
 
-    clinical_features = build_clinical_features(clinical)
+    clinical_features = build_clinical_features(clinical, train_ids=train_ids)
     fs_matrices, fs_meta = build_feature_set_matrices(
         endpoint_full["PATIENT_ID"].tolist(), train_ids, clinical_features,
         feature_df, expression_genes, causal_genes)
@@ -1737,12 +1833,14 @@ def run_fixed_timepoint(tp_name, tau_months, eval_times, timestamp, clinical, fe
     for col in ["uno_cindex", "ipcw_auc", "ipcw_brier"]:
         if col in ranking_df.columns:
             asc = True if col == "ipcw_brier" else False
-            ranking_df[f"{col}_rank"] = ranking_df[col].rank(ascending=asc, method="average")
+            ranking_df[f"{col}_rank"] = ranking_df[col].rank(ascending=asc, method="average", na_option="bottom")
     rank_cols = [c for c in ranking_df.columns if c.endswith("_rank")]
     if rank_cols:
-        ranking_df["selection_score"] = ranking_df[rank_cols].sum(axis=1)
+        # P0 fix: min_count 防止全 NaN rank 行 selection_score=0 误排第一
+        ranking_df["selection_score"] = ranking_df[rank_cols].sum(axis=1, min_count=len(rank_cols))
         best_row = ranking_df.sort_values(
-            ["selection_score", "uno_cindex_rank", "ipcw_brier_rank"]
+            ["selection_score", "uno_cindex_rank", "ipcw_brier_rank"],
+            na_position="last",
         ).iloc[0]
         best_model_name = best_row["model"]
     else:
@@ -1804,7 +1902,7 @@ def run_unlimited_timepoint(timestamp, clinical, feature_df, train_ids, val_ids)
     pd.DataFrame({"feature": fused_genes}).to_csv(
         os.path.join(results_base, "fused_gene_list.tsv"), sep="\t", index=False)
 
-    clinical_features = build_clinical_features(clinical)
+    clinical_features = build_clinical_features(clinical, train_ids=train_ids)
     fs_matrices, fs_meta = build_feature_set_matrices(
         endpoint_full["PATIENT_ID"].tolist(), train_ids, clinical_features,
         feature_df, expression_genes, causal_genes)
@@ -1885,15 +1983,17 @@ def run_unlimited_timepoint(timestamp, clinical, feature_df, train_ids, val_ids)
     ranking_df = comp_df.copy()
     for col in ["uno_cindex"]:
         if col in ranking_df.columns:
-            ranking_df[f"{col}_rank"] = ranking_df[col].rank(ascending=False, method="average")
+            ranking_df[f"{col}_rank"] = ranking_df[col].rank(ascending=False, method="average", na_option="bottom")
     if "integrated_brier_score" in ranking_df.columns:
         ranking_df["integrated_brier_score_rank"] = ranking_df["integrated_brier_score"].rank(
-            ascending=True, method="average")
+            ascending=True, method="average", na_option="bottom")
     rank_cols = [c for c in ranking_df.columns if c.endswith("_rank")]
     if rank_cols:
-        ranking_df["selection_score"] = ranking_df[rank_cols].sum(axis=1)
+        # P0 fix: min_count 防止全 NaN rank 行 selection_score=0 误排第一
+        ranking_df["selection_score"] = ranking_df[rank_cols].sum(axis=1, min_count=len(rank_cols))
         best_row = ranking_df.sort_values(
-            ["selection_score", "uno_cindex_rank", "integrated_brier_score_rank"]
+            ["selection_score", "uno_cindex_rank", "integrated_brier_score_rank"],
+            na_position="last",
         ).iloc[0]
         best_model_name = best_row["model"]
     else:
