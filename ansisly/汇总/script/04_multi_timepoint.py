@@ -889,7 +889,8 @@ def build_clinical_features(clinical_df, train_ids=None):
         if len(train_vals) < 3:
             rint_df[col] = raw
             continue
-        qt = QuantileTransformer(output_distribution="normal", random_state=RANDOM_SEED)
+        n_q = min(1000, len(train_vals))
+        qt = QuantileTransformer(n_quantiles=n_q, output_distribution="normal", random_state=RANDOM_SEED)
         qt.fit(train_vals)
         all_vals = raw.to_numpy().reshape(-1, 1)
         valid_mask = ~np.isnan(all_vals.ravel())
@@ -1311,7 +1312,8 @@ def prepare_features(clinical_ids, feature_df, train_ids, apply_rint=True):
             train_vals = X_work.loc[train_idx, col].dropna().to_numpy().reshape(-1, 1)
             if len(train_vals) < 3:
                 continue
-            qt = _QT(output_distribution="normal", random_state=RANDOM_SEED)
+            n_q = min(1000, len(train_vals))
+            qt = _QT(n_quantiles=n_q, output_distribution="normal", random_state=RANDOM_SEED)
             qt.fit(train_vals)
             all_vals = X_work[col].to_numpy().reshape(-1, 1)
             valid = ~np.isnan(all_vals.ravel())

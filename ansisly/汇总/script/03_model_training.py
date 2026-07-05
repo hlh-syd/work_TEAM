@@ -1175,7 +1175,8 @@ class ConditionalTabularGAN:
         if skip_scaler:
             self.scaler = None
         else:
-            self.scaler = QuantileTransformer(output_distribution="normal", random_state=random_seed)
+            # Placeholder; actual n_quantiles set dynamically in fit()
+            self.scaler = QuantileTransformer(n_quantiles=100, output_distribution="normal", random_state=random_seed)
         self.generator = None
         self.feature_columns = []
         self.status = "not_fitted"
@@ -1322,7 +1323,9 @@ class ConditionalTabularGAN:
             c = torch.tensor(cond, dtype=torch.float32)
             fake = self.generator(torch.cat([z, c], dim=1)).numpy()
         self.generator.train()
-        inv = fake if self.skip_scaler or self.scaler is None else self.scaler.inverse_transform(fake)
+        inv = fake if self.skip_scaler or self.scaler is None else self.scaler.inverse_transform(
+            pd.DataFrame(fake, columns=self.feature_columns)
+        )
         return pd.DataFrame(inv, columns=self.feature_columns)
 
 
@@ -1467,7 +1470,9 @@ class SurvivalConditionalTabularGAN(ConditionalTabularGAN):
             c = torch.tensor(cond, dtype=torch.float32)
             fake = self.generator(torch.cat([z, c], dim=1)).numpy()
         self.generator.train()
-        inv = fake if self.skip_scaler or self.scaler is None else self.scaler.inverse_transform(fake)
+        inv = fake if self.skip_scaler or self.scaler is None else self.scaler.inverse_transform(
+            pd.DataFrame(fake, columns=self.feature_columns)
+        )
         return pd.DataFrame(inv, columns=self.feature_columns)
 
 
@@ -1670,7 +1675,7 @@ def train_only_gan_augmentation(X_train, endpoint_train, train_ids, gan_epochs, 
                 continue
             syn_event = cond_rows["death_by_36m"].round().astype(int).to_numpy()
             # P0-3 fix: 从条件向量的 log1p_time_months 反推合成样本生存时间
-            syn_time = np.expm1(cond_rows["log1p_time_months"].to_numpy()).clip(lower=0.0)
+            syn_time = np.expm1(cond_rows["log1p_time_months"].to_numpy()).clip(0.0)
             real_event = y_obs.reindex(train_ids).to_numpy()
             syn_calibrated = _moment_match_calibrate(syn, X_train.loc[train_ids], syn_event == 1, real_event)
             qc = synthetic_data_qc(X_train.loc[train_ids], syn_calibrated, X_holdout, random_seed=seed)
