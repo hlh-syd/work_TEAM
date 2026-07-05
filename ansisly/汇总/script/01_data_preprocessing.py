@@ -14,6 +14,7 @@ import pandas as pd
 from lifelines import KaplanMeierFitter
 from scipy import stats
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.impute import KNNImputer
 
 import polars as pl
 
@@ -25,6 +26,7 @@ from shared_utils import (
     parse_survival_status, numeric_series, encode_ajcc_stage,
     kaplan_meier_survival_at, km_cumulative_incidence_by_tau,
 )
+from gain_imputer import GAINImputer
 logger = setup_logger("01_preprocessing")
 
 
@@ -288,15 +290,56 @@ def load_cnv():
     return patient_matrix
 
 
-def load_methylation(probe_blacklist=None, min_iqr=0.0):
+def _apply_knn_imputer(matrix: np.ndarray, log, n_neighbors: int = 5) -> np.ndarray:
+    """KNN 填补器回退方案。
+
+    使用 sklearn KNNImputer 对矩阵进行 KNN 填补。
+    若全 NaN 列无法填补，则回退到 0 填充。
+    """
+    nan_mask = np.isnan(matrix)
+    if not nan_mask.any():
+        return matrix
+    # 全 NaN 列无法 KNN 填补，先置 0
+    all_nan_cols = np.all(nan_mask, axis=0)
+    if all_nan_cols.any():
+        log.warning(f"  [KNN] 发现 {int(all_nan_cols.sum())} 个全NaN列，回退填充为 0")
+        matrix[:, all_nan_cols] = 0.0
+        nan_mask = np.isnan(matrix)
+    imputer = KNNImputer(n_neighbors=n_neighbors, weights="distance")
+    try:
+        matrix = imputer.fit_transform(matrix)
+    except Exception as e:
+        log.error(f"  [KNN] KNNImputer 失败({e})，回退到列均值填充")
+        col_means = np.nanmean(matrix, axis=0)
+        col_means = np.where(np.isnan(col_means), 0.0, col_means)
+        matrix = np.where(np.isnan(matrix), col_means, matrix)
+    n_filled = int(nan_mask.sum())
+    log.info(f"  [KNN] 填补完成: {n_filled} 个缺失值")
+    return matrix
+
+
+def load_methylation(probe_blacklist=None, min_iqr=0.05,
+                     gain_epochs=500, gain_batch_size=64,
+                     use_gain=True):
     """加载 HM450 甲基化数据，使用 Polars + numpy 全链路优化。
+
+    预处理顺序（两阶段策略）:
+        1. 移除全 NaN 探针列
+        2. Stage A: 快速中位数预填补 → IQR 低变异过滤（降维）
+        3. Stage B: GAIN 填补（失败则回退 KNN 填补）→ Z-score 标准化
 
     Parameters
     ----------
     probe_blacklist : set/list/None
         需要过滤的探针 ID 集合（如性染色体/交叉反应探针）
     min_iqr : float
-        IQR 阈值，> 0 时启用低变异过滤；默认 0.0 不过滤
+        IQR 阈值，> 0 时启用低变异过滤；默认 0.05
+    gain_epochs : int
+        GAIN 最大训练轮数；默认 500
+    gain_batch_size : int
+        GAIN 训练批量大小；默认 64
+    use_gain : bool
+        是否启用 GAIN 填补（默认 True）；False 时回退到 KNN 填补
     """
     import time as _time
     meth_path = os.path.join(TCGA_DIR, "data_methylation_hm450.txt")
@@ -415,10 +458,21 @@ def load_methylation(probe_blacklist=None, min_iqr=0.0):
         logger.info(f"  移除全NaN探针列: {n_removed} 个")
     del col_not_all_nan
 
-    # ── Step 4: 低变异过滤（可选） ───────────────────────────────────
+    # ── Step 4: Stage A — 快速中位数预填补 + IQR 低变异过滤 ──────────
+    # 先用快速中位数预填补（仅用于 IQR 计算，保证过滤结果准确）
+    _quick_medians = np.nanmedian(matrix, axis=0)
+    _nan_quick_med = np.isnan(_quick_medians)
+    if _nan_quick_med.any():
+        _global_med = np.nanmedian(matrix)
+        if np.isnan(_global_med):
+            _global_med = 0.0
+        _quick_medians = np.where(_nan_quick_med, _global_med, _quick_medians)
+    _matrix_prefill = np.where(np.isnan(matrix), _quick_medians, matrix)
+    del _quick_medians, _nan_quick_med
+
     if min_iqr > 0:
-        q75 = np.nanpercentile(matrix, 75, axis=0)
-        q25 = np.nanpercentile(matrix, 25, axis=0)
+        q75 = np.percentile(_matrix_prefill, 75, axis=0)
+        q25 = np.percentile(_matrix_prefill, 25, axis=0)
         iqr = q75 - q25
         keep_mask = iqr >= min_iqr
         n_before = matrix.shape[1]
@@ -426,24 +480,35 @@ def load_methylation(probe_blacklist=None, min_iqr=0.0):
         probe_ids = [p for p, k in zip(probe_ids, keep_mask) if k]
         logger.info(f"  低变异过滤(IQR>={min_iqr}): {n_before} -> {matrix.shape[1]} 探针")
         del q75, q25, iqr, keep_mask
+    del _matrix_prefill
 
-    # ── Step 5: numpy 层缺失值填充 ───────────────────────────────────
-    medians = np.nanmedian(matrix, axis=0)
-    # 若某列全 NaN，nanmedian 返回 NaN，需用全局中位数回退
-    nan_medians = np.isnan(medians)
-    if nan_medians.any():
-        global_median = np.nanmedian(matrix)
-        if np.isnan(global_median):
-            global_median = 0.0
-        medians = np.where(nan_medians, global_median, medians)
-    nan_mask = np.isnan(matrix)
-    if nan_mask.any():
-        matrix = np.where(nan_mask, medians, matrix)
-        n_filled = int(nan_mask.sum())
-        logger.info(f"  缺失值填充: {n_filled} 个值")
-    del medians, nan_mask, nan_medians
+    # ── Step 5: Stage B — GAIN 填补（失败回退 KNN）───────────────────────
+    _knn_fallback = lambda mat: _apply_knn_imputer(mat, logger)
+    if use_gain:
+        try:
+            logger.info(f"  [GAIN] 对 {matrix.shape[1]} 探针子矩阵执行 GAIN 填补...")
+            gainer = GAINImputer(
+                n_epochs=gain_epochs,
+                batch_size=gain_batch_size,
+                lr=1e-3,
+                seed=20260604,
+                patience=50,
+            )
+            _orig_nan_mask = np.isnan(matrix)
+            matrix = gainer.fit_transform(matrix)
+            # 仅替换缺失位置，保留观测值不变
+            if _orig_nan_mask.any():
+                matrix = np.where(_orig_nan_mask, matrix, matrix)
+            del _orig_nan_mask
+            logger.info("  [GAIN] 填补完成")
+        except Exception as e:
+            logger.warning(f"  [GAIN] 填补失败({e})，回退到 KNN 填补")
+            matrix = _knn_fallback(matrix)
+    else:
+        logger.info("  [KNN] use_gain=False，使用 KNN 填补")
+        matrix = _knn_fallback(matrix)
 
-    # ── Step 6: numpy 层标准化 ───────────────────────────────────────
+    # ── Step 6: numpy 层 Z-score 标准化 ──────────────────────────────────
     mean = np.nanmean(matrix, axis=0)
     std = np.nanstd(matrix, axis=0)
     matrix = (matrix - mean) / np.clip(std, EPS, None)
@@ -551,11 +616,24 @@ def align_samples(clinical_df, gene_df, mutation_df, cnv_df, methylation_df, rpp
     methylation_aligned = methylation_df.loc[methylation_df.index.astype(str).isin(common_ids)] if methylation_df is not None and not methylation_df.empty else pd.DataFrame()
     rppa_aligned = rppa_df.loc[rppa_df.index.astype(str).isin(common_ids)] if rppa_df is not None and not rppa_df.empty else pd.DataFrame()
 
-    return common_ids, clinical_aligned, gene_aligned, mutation_aligned, cnv_aligned, methylation_aligned, rppa_aligned
+    # ── 构建缺失指示变量（1=有数据, 0=该组学缺失）──────────────────
+    missing_indicators = {}
+    for name, s in omics_sets.items():
+        missing_indicators[name] = pd.Series(
+            [1 if pid in s else 0 for pid in common_ids],
+            index=common_ids, dtype=np.int8
+        )
+    if missing_indicators:
+        for name, ind in missing_indicators.items():
+            n_present = int(ind.sum())
+            logger.info(f"    缺失指示 [{name}]: {n_present}/{len(common_ids)} 有数据")
+
+    return common_ids, clinical_aligned, gene_aligned, mutation_aligned, cnv_aligned, methylation_aligned, rppa_aligned, missing_indicators
 
 
 def save_preprocessed(output_dir, clinical_df, gene_df, gene_names, mutation_df,
-                       cnv_df, methylation_df, rppa_df, sample_ids, config):
+                       cnv_df, methylation_df, rppa_df, sample_ids, config,
+                       missing_indicators=None):
     os.makedirs(output_dir, exist_ok=True)
 
     clinical_df.to_csv(os.path.join(output_dir, "tcga_os_clinical_endpoint_qc.tsv"),
@@ -592,6 +670,12 @@ def save_preprocessed(output_dir, clinical_df, gene_df, gene_names, mutation_df,
 
     if rppa_df is not None and not rppa_df.empty:
         rppa_df.to_csv(os.path.join(output_dir, "rppa_curated.tsv"), sep="\t")
+
+    # 保存缺失指示变量
+    if missing_indicators:
+        indicator_df = pd.DataFrame(missing_indicators, index=sample_ids)
+        indicator_df.to_csv(os.path.join(output_dir, "omics_missing_indicators.tsv"), sep="\t")
+        logger.info(f"  缺失指示变量已保存: {len(missing_indicators)} 种组学")
 
     with open(os.path.join(output_dir, "sample_ids.pkl"), "wb") as f:
         pickle.dump(sample_ids, f)
@@ -680,7 +764,7 @@ def main():
 
     logger.info("[STEP 6/8] 加载甲基化数据...")
     try:
-        methylation_df = load_methylation()
+        methylation_df = load_methylation(min_iqr=0.05, use_gain=True)
         logger.info(f"  甲基化: {methylation_df.shape[0]} 患者 x {methylation_df.shape[1]} 特征")
     except (FileNotFoundError, ValueError) as e:
         logger.warning(f"  [WARNING] {e}")
@@ -693,7 +777,7 @@ def main():
         logger.warning(f"  [WARNING] {e}")
 
     logger.info("[STEP 8/8] 对齐样本并保存...")
-    sample_ids, clinical_aligned, gene_aligned, mutation_aligned, cnv_aligned, methylation_aligned, rppa_aligned = align_samples(
+    sample_ids, clinical_aligned, gene_aligned, mutation_aligned, cnv_aligned, methylation_aligned, rppa_aligned, missing_indicators = align_samples(
         clinical_df, gene_df, mutation_df, cnv_df, methylation_df, rppa_df
     )
     logger.info(f"  对齐后样本数: {len(sample_ids)}")
@@ -712,7 +796,7 @@ def main():
     save_preprocessed(
         output_dir, clinical_aligned, gene_aligned, gene_names,
         mutation_aligned, cnv_aligned, methylation_aligned, rppa_aligned,
-        sample_ids, config,
+        sample_ids, config, missing_indicators=missing_indicators,
     )
 
     logger.info(f"[01_preprocessing] 完成! 结果保存到: {output_dir}")
