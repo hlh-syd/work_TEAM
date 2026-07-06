@@ -294,6 +294,14 @@ def load_cnv():
     patient_matrix.index = [patient_id_from_sample(c) for c in patient_matrix.index]
     patient_matrix = patient_matrix.groupby(level=0).mean()
 
+    # ── 零方差特征过滤：移除在所有样本中值完全相同的列 ──
+    col_var = patient_matrix.var(axis=0, skipna=True)
+    n_before = patient_matrix.shape[1]
+    patient_matrix = patient_matrix.loc[:, col_var > 0]
+    n_removed = n_before - patient_matrix.shape[1]
+    if n_removed > 0:
+        print(f"  [CNV] 零方差过滤: 移除 {n_removed} 个常数列特征 ({n_before} → {patient_matrix.shape[1]})")
+
     scaler = StandardScaler()
     scaled_values = scaler.fit_transform(patient_matrix.values)
     patient_matrix = pd.DataFrame(scaled_values, index=patient_matrix.index, columns=patient_matrix.columns)
@@ -582,6 +590,14 @@ def load_rppa():
     patient_matrix = numeric.T.copy()
     patient_matrix.index = [patient_id_from_sample(c) for c in patient_matrix.index]
     patient_matrix = patient_matrix.groupby(level=0).mean()
+
+    # ── 零方差特征过滤：移除在所有样本中值完全相同的列 ──
+    col_var = patient_matrix.var(axis=0, skipna=True)
+    n_before = patient_matrix.shape[1]
+    patient_matrix = patient_matrix.loc[:, col_var > 0]
+    n_removed = n_before - patient_matrix.shape[1]
+    if n_removed > 0:
+        print(f"  [RPPA] 零方差过滤: 移除 {n_removed} 个常数列特征 ({n_before} → {patient_matrix.shape[1]})")
 
     scaler = StandardScaler()
     scaled_values = scaler.fit_transform(patient_matrix.values)
