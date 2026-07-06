@@ -65,6 +65,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="lifelines")
 from shared_utils import (
     setup_logger,
     SCRIPT_DIR, DATA_DIR, RESULTS_DIR,
+    ESSENTIAL_DIR,
     RANDOM_SEED, EPS, DEFAULT_TIMEPOINTS, FIXED_TAU_MONTHS,
     ensure_dir, safe_read_tsv, sanitize_filename, normalize_patient_id,
     kaplan_meier_survival_at, km_cumulative_incidence_by_tau,
@@ -1250,7 +1251,7 @@ def load_input_data(timestamp):
     改为返回原始基因表达矩阵，由各端点函数独立执行特征筛选。
     """
     results_base = os.path.join(RESULTS_DIR, timestamp)
-    preproc_dir = os.path.join(results_base, "01_preprocessing")
+    preproc_dir = ESSENTIAL_DIR
     clinical_path = os.path.join(preproc_dir, "tcga_os_clinical_endpoint_qc.tsv")
     split_path = os.path.join(preproc_dir, "tcga_train_internal_validation_split.tsv")
     if not os.path.exists(split_path):

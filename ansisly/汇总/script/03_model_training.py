@@ -68,6 +68,7 @@ except Exception:
 from shared_utils import (
     setup_logger,
     SCRIPT_DIR, DATA_DIR, RESULTS_DIR,
+    ESSENTIAL_DIR,
     FIXED_TAU_MONTHS, EPS, RANDOM_SEED, RANDOM_SEED_GAN,
     STAGE_MAP_GROUP as STAGE_MAP, META_COLUMNS,
     parse_survival_status, numeric_series, stage_to_group,
@@ -2140,7 +2141,7 @@ def main():
     for d in [out_dir, models_dir, eval_dir, fig_dir]:
         os.makedirs(d, exist_ok=True)
 
-    prev01 = os.path.join(RESULTS_DIR, timestamp, "01_preprocessing")
+    prev01 = ESSENTIAL_DIR
     prev02 = os.path.join(RESULTS_DIR, timestamp, "02_gene_features")
 
     logger.info(f"[03] Loading 01 preprocessing outputs from {prev01}")
@@ -2188,7 +2189,7 @@ def main():
         candidate_genes = []
     logger.info(f"[03] Candidate genes from 02: {len(candidate_genes)}")
 
-    split_path = os.path.join(RESULTS_DIR, timestamp, "01_preprocessing", "tcga_train_internal_validation_split.tsv")
+    split_path = os.path.join(prev01, "tcga_train_internal_validation_split.tsv")
     if not os.path.exists(split_path):
         split_path = os.path.join(DATA_DIR, "survival_models", "tcga_train_internal_validation_split.tsv")
     if os.path.exists(split_path):

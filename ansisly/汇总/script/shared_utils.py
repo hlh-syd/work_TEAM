@@ -41,6 +41,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "DATA"))
 RESULTS_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "results"))
 
+# 预处理数据前向目录（跨 timestamp 持久化存储）
+DATA_FORWARD_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "data-forword"))
+ESSENTIAL_DIR = os.path.join(DATA_FORWARD_DIR, "必要")       # 下游脚本必需的预处理数据
+NON_ESSENTIAL_DIR = os.path.join(DATA_FORWARD_DIR, "非必要")  # QC 图表、敏感性分析等非核心数据
+
 FIXED_TAU_MONTHS = 36.0
 RANDOM_SEED = 20260604
 RANDOM_SEED_GAN = 20260604

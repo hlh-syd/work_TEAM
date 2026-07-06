@@ -30,6 +30,7 @@ import matplotlib.pyplot as plt
 from shared_utils import (
     setup_logger,
     SCRIPT_DIR, DATA_DIR, RESULTS_DIR,
+    ESSENTIAL_DIR,
     FIXED_TAU_MONTHS, RANDOM_SEED,
     patient_id_from_sample,
     encode_ajcc_stage as _shared_encode_ajcc_stage,
@@ -1266,7 +1267,7 @@ def main():
     out_dir = os.path.join(RESULTS_DIR, timestamp, "02_gene_features")
     os.makedirs(out_dir, exist_ok=True)
 
-    prev_dir = os.path.join(RESULTS_DIR, timestamp, "01_preprocessing")
+    prev_dir = ESSENTIAL_DIR
 
     clinical_path = os.path.join(prev_dir, "tcga_os_clinical_endpoint_qc.tsv")
     survival_labels_path = os.path.join(prev_dir, "survival_labels.pkl")

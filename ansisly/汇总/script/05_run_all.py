@@ -32,6 +32,7 @@ import numpy as np
 
 from shared_utils import (
     SCRIPT_DIR, DATA_DIR, RESULTS_DIR,
+    ESSENTIAL_DIR,
     ensure_dir, setup_logger, load_pipeline_config,
 )
 
@@ -101,6 +102,9 @@ STEP_OUTPUTS = {
         "survival_labels.pkl",
         "gene_expression_curated.tsv",
         "preprocessing_config.json",
+        "tcga_os_clinical_endpoint_qc.tsv",
+        "gene_names.pkl",
+        "sample_ids.pkl",
     ],
     "02_gene_features": [
         "final_gene_list.pkl",
@@ -151,12 +155,21 @@ def copy_data(raw_dir: str, data_dir: str) -> None:
 # 数据契约校验
 # ──────────────────────────────────────────────────────────────────────
 def validate_step_outputs(results_dir: str, timestamp: str, step_name: str) -> bool:
-    """验证某步骤输出文件是否完整。返回 True 表示完整可跳过。"""
+    """验证某步骤输出文件是否完整。返回 True 表示完整可跳过。
+
+    特殊处理: 01_data_preprocessing 的输出存储在 ESSENTIAL_DIR（跨 timestamp 持久化目录），
+    而非 results_dir/timestamp/ 下。
+    """
     expected = STEP_OUTPUTS.get(step_name, [])
     if not expected:
         return False  # 无静态清单，不做校验
 
-    step_dir = os.path.join(results_dir, timestamp, step_name)
+    # 01_data_preprocessing 输出存储在持久化的 ESSENTIAL_DIR，而非时间戳目录
+    if step_name == "01_data_preprocessing":
+        step_dir = ESSENTIAL_DIR
+    else:
+        step_dir = os.path.join(results_dir, timestamp, step_name)
+
     if not os.path.isdir(step_dir):
         return False
 
