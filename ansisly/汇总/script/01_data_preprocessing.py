@@ -27,7 +27,7 @@ from shared_utils import (
     parse_survival_status, numeric_series, encode_ajcc_stage,
     kaplan_meier_survival_at, km_cumulative_incidence_by_tau,
 )
-from gain_imputer import GAINImputer
+
 logger = setup_logger("01_preprocessing")
 
 import matplotlib
@@ -337,15 +337,67 @@ def _apply_knn_imputer(matrix: np.ndarray, log, n_neighbors: int = 5) -> np.ndar
     return matrix
 
 
-def load_methylation(probe_blacklist=None, min_iqr=0.05,
-                     gain_epochs=500, gain_batch_size=64,
-                     use_gain=True):
+def _run_masking_validation(matrix: np.ndarray, impute_fn, log,
+                            mask_rate: float = 0.10, seed: int = 20260605):
+    """通用 masking 验证：随机隐藏已知观测值，填补后计算 RMSE/MAE/R²。
+
+    Parameters
+    ----------
+    matrix : np.ndarray
+        含 NaN 的原始矩阵（不会被修改）
+    impute_fn : callable
+        填补函数，签名 (np.ndarray) -> np.ndarray
+    mask_rate : float
+        随机隐藏已知观测值的比例
+    seed : int
+        随机种子（确保各方法隐藏相同位置）
+
+    Returns
+    -------
+    dict : {rmse, mae, r_squared, n_holdout}
+    """
+    mat = matrix.copy()
+    obs_mask = ~np.isnan(mat)  # 1=观测, 0=缺失
+    rng = np.random.RandomState(seed)
+    obs_indices = np.argwhere(obs_mask)
+    n_obs = len(obs_indices)
+    n_holdout = max(1, int(n_obs * mask_rate))
+    holdout_idx = rng.choice(n_obs, size=n_holdout, replace=False)
+    holdout_coords = obs_indices[holdout_idx]
+
+    # 保存真实值并隐藏
+    val_true = mat[holdout_coords[:, 0], holdout_coords[:, 1]].copy()
+    mat[holdout_coords[:, 0], holdout_coords[:, 1]] = np.nan
+
+    # 执行填补
+    filled = impute_fn(mat)
+
+    # 计算指标
+    val_pred = filled[holdout_coords[:, 0], holdout_coords[:, 1]]
+    residuals = val_true - val_pred
+    rmse = float(np.sqrt(np.mean(residuals ** 2)))
+    mae = float(np.mean(np.abs(residuals)))
+    ss_res = float(np.sum(residuals ** 2))
+    ss_tot = float(np.sum((val_true - np.mean(val_true)) ** 2))
+    r_squared = float(1.0 - ss_res / max(ss_tot, 1e-12))
+
+    metrics = {
+        "rmse": round(rmse, 6),
+        "mae": round(mae, 6),
+        "r_squared": round(r_squared, 4),
+        "n_holdout": n_holdout,
+    }
+    log.info(f"  [Masking] 验证: holdout={n_holdout}, RMSE={rmse:.4f}, MAE={mae:.4f}, R²={r_squared:.4f}")
+    return metrics
+
+
+def load_methylation(probe_blacklist=None, min_iqr=0.05):
     """加载 HM450 甲基化数据，使用 Polars + numpy 全链路优化。
 
     预处理顺序（两阶段策略）:
         1. 移除全 NaN 探针列
         2. Stage A: 快速中位数预填补 → IQR 低变异过滤（降维）
-        3. Stage B: GAIN 填补（失败则回退 KNN 填补）→ Z-score 标准化
+        3. Stage B: KNN 填补 + masking 验证 → Z-score 标准化
 
     Parameters
     ----------
@@ -353,12 +405,6 @@ def load_methylation(probe_blacklist=None, min_iqr=0.05,
         需要过滤的探针 ID 集合（如性染色体/交叉反应探针）
     min_iqr : float
         IQR 阈值，> 0 时启用低变异过滤；默认 0.05
-    gain_epochs : int
-        GAIN 最大训练轮数；默认 500
-    gain_batch_size : int
-        GAIN 训练批量大小；默认 64
-    use_gain : bool
-        是否启用 GAIN 填补（默认 True）；False 时回退到 KNN 填补
     """
     import time as _time
     meth_path = os.path.join(TCGA_DIR, "data_methylation_hm450.txt")
@@ -509,42 +555,27 @@ def load_methylation(probe_blacklist=None, min_iqr=0.05,
         del q75, q25, iqr, keep_mask
     del _matrix_prefill
 
-    # ── Step 5: Stage B — GAIN 填补（失败回退 KNN）───────────────────────
-    _knn_fallback = lambda mat: _apply_knn_imputer(mat, logger)
+    # ── Step 5: KNN 填补 + masking 验证 ─────────────────────────────
     meth_validation = {}
-    if use_gain:
-        try:
-            logger.info(f"  [GAIN] 对 {matrix.shape[1]} 探针子矩阵执行 GAIN 填补...")
-            gainer = GAINImputer(
-                n_epochs=gain_epochs,
-                batch_size=gain_batch_size,
-                lr=1e-3,
-                seed=20260604,
-                patience=50,
-            )
-            _orig_nan_mask = np.isnan(matrix)
-            matrix, _gain_val = gainer.fit_transform(matrix, return_validation=True)
-            # 合并 GAIN masking 验证指标
-            if _gain_val:
-                meth_validation.update({
-                    "gain_rmse": _gain_val.get("rmse", np.nan),
-                    "gain_mae": _gain_val.get("mae", np.nan),
-                    "gain_r_squared": _gain_val.get("r_squared", np.nan),
-                    "gain_median_abs_error": _gain_val.get("median_absolute_error", np.nan),
-                    "gain_n_validated": _gain_val.get("n_holdout", 0),
-                })
-            del _gain_val
-            # 仅替换缺失位置，保留观测值不变
-            if _orig_nan_mask.any():
-                matrix = np.where(_orig_nan_mask, matrix, matrix)
-            del _orig_nan_mask
-            logger.info("  [GAIN] 填补完成")
-        except Exception as e:
-            logger.warning(f"  [GAIN] 填补失败({e})，回退到 KNN 填补")
-            matrix = _knn_fallback(matrix)
-    else:
-        logger.info("  [KNN] use_gain=False，使用 KNN 填补")
-        matrix = _knn_fallback(matrix)
+
+    logger.info(f"  [KNN] 对 {matrix.shape[1]} 探针矩阵执行 KNN 填补...")
+    _knn_filled = _apply_knn_imputer(matrix.copy(), logger)
+    logger.info("  [KNN] masking 验证...")
+    _knn_metrics = _run_masking_validation(
+        matrix, lambda m: _apply_knn_imputer(m, logger), logger
+    )
+    matrix = _knn_filled
+    del _knn_filled
+
+    # 记录 QC 指标
+    meth_validation.update({
+        "imputation_method": "knn",
+        "imputation_rmse": _knn_metrics.get("rmse", np.nan),
+        "imputation_mae": _knn_metrics.get("mae", np.nan),
+        "imputation_r_squared": _knn_metrics.get("r_squared", np.nan),
+        "imputation_candidates": {"knn": _knn_metrics.get("r_squared")},
+    })
+    del _knn_metrics
 
     # ── Step 6: numpy 层 Z-score 标准化 ──────────────────────────────────
     mean = np.nanmean(matrix, axis=0)
@@ -967,10 +998,10 @@ def compute_qc_metrics(
         m["methylation_residual_nan_rate"] = round(float(np.isnan(meth_vals).mean()), 6)
         m["methylation_n_probes_final"] = methylation_df.shape[1]
 
-    # ── 7. GAIN 填补质量评估（新增）────────────────────────────────
+    # ── 7. 填补质量评估（KNN masking 验证）──────────────────────
     if meth_validation:
-        for key in ["gain_rmse", "gain_mae", "gain_r_squared",
-                     "gain_median_abs_error", "gain_n_validated"]:
+        for key in ["imputation_method", "imputation_rmse", "imputation_mae",
+                     "imputation_r_squared", "imputation_candidates"]:
             if key in meth_validation:
                 m[key] = meth_validation[key]
         # IQR 过滤统计
@@ -1675,10 +1706,10 @@ def generate_qc_plots(
     except Exception as e:
         logger.warning(f"  [QC Plot 7] failed: {e}")
 
-    # ── Plot 8: GAIN imputation quality (A: density, B: masking scatter, C: QQ) ─
+    # ── Plot 8: Imputation quality (A: density, B: masking validation, C: QQ) ─
     try:
-        has_gain = meth_validation and meth_validation.get("gain_rmse") is not None
-        if _safe_df(methylation_df) or has_gain:
+        has_imputation = meth_validation and meth_validation.get("imputation_r_squared") is not None
+        if _safe_df(methylation_df) or has_imputation:
             fig, axes_8 = plt.subplots(1, 3, figsize=(15, 4.5))
             # Panel A: Density (post-imputation Z-score)
             ax = axes_8[0]
@@ -1713,24 +1744,30 @@ def generate_qc_plots(
             ax.set_title("A  Post-Imputation Density", loc="left", fontweight="bold")
             ax.legend(fontsize=7, loc="upper right")
 
-            # Panel B: Masking validation scatter
+            # Panel B: Masking validation (KNN)
             ax = axes_8[1]
-            if has_gain:
-                rmse = meth_validation.get("gain_rmse", np.nan)
-                r2 = meth_validation.get("gain_r_squared", np.nan)
+            if has_imputation:
+                best_m = meth_validation.get("imputation_method", "?")
+                rmse = meth_validation.get("imputation_rmse", np.nan)
+                r2 = meth_validation.get("imputation_r_squared", np.nan)
+                cands = meth_validation.get("imputation_candidates", {})
+                cand_lines = "\n".join(
+                    f"  {cn}: R² = {cr:.4f}" if cr is not None else f"  {cn}: N/A"
+                    for cn, cr in cands.items()
+                )
                 ax.text(0.5, 0.5,
-                        f"GAIN Masking Validation\nRMSE = {rmse:.4f}\nR\u00b2 = {r2:.4f}",
+                        f"Best Method: {best_m.upper()}\n"
+                        f"RMSE = {rmse:.4f}   R\u00b2 = {r2:.4f}\n"
+                        f"─── Candidates ───\n{cand_lines}",
                         ha="center", va="center", transform=ax.transAxes,
-                        fontsize=11, fontweight="bold",
+                        fontsize=9, fontweight="bold", family="monospace",
                         bbox=dict(boxstyle="round,pad=0.5", facecolor=NATURE_PALETTE["skyblue"],
                                   edgecolor=NATURE_PALETTE["blue"], alpha=0.3))
-                ax.set_xlabel("True Value")
-                ax.set_ylabel("GAIN Predicted")
             else:
-                ax.text(0.5, 0.5, "No GAIN validation\ndata available",
+                ax.text(0.5, 0.5, "No imputation validation\ndata available",
                         ha="center", va="center", transform=ax.transAxes,
                         fontsize=10, color="gray")
-            ax.set_title("B  GAIN Masking Validation", loc="left", fontweight="bold")
+            ax.set_title("B  Imputation Masking Validation", loc="left", fontweight="bold")
 
             # Panel C: QQ-plot
             ax = axes_8[2]
@@ -1754,11 +1791,11 @@ def generate_qc_plots(
             ax.set_xlabel("Theoretical Quantiles")
             ax.set_ylabel("Sample Quantiles")
             ax.set_title("C  QQ-Plot (vs Normal)", loc="left", fontweight="bold")
-            plt.suptitle("GAIN Imputation Quality Assessment", fontsize=13, fontweight="bold", y=1.02)
+            plt.suptitle("Imputation Quality Assessment", fontsize=13, fontweight="bold", y=1.02)
             plt.tight_layout()
-            fig.savefig(os.path.join(qc_dir, "08_gain_imputation_quality.png"), bbox_inches="tight")
+            fig.savefig(os.path.join(qc_dir, "08_imputation_quality.png"), bbox_inches="tight")
             plt.close(fig)
-            logger.info("  [QC Plot 8/10] 08_gain_imputation_quality.png saved")
+            logger.info("  [QC Plot 8/10] 08_imputation_quality.png saved")
     except Exception as e:
         logger.warning(f"  [QC Plot 8] failed: {e}")
 
@@ -1843,8 +1880,11 @@ def generate_qc_plots(
             n_feat = metrics.get(f"{name}_n_features", 0)
             mr = metrics.get(f"{name}_missing_rate", np.nan)
             summary_lines.append(f"  {name.capitalize()}: {n_feat} features, missing={mr:.2%}" if not np.isnan(mr) else f"  {name.capitalize()}: N/A")
-        if "gain_rmse" in metrics:
-            summary_lines.append(f"GAIN RMSE={metrics['gain_rmse']:.4f}, R\u00b2={metrics.get('gain_r_squared', np.nan):.4f}")
+        if "imputation_rmse" in metrics:
+            summary_lines.append(
+                f"Imputation({metrics.get('imputation_method', '?').upper()}) "
+                f"RMSE={metrics['imputation_rmse']:.4f}, R\u00b2={metrics.get('imputation_r_squared', np.nan):.4f}"
+            )
         if "meth_n_before_iqr" in metrics:
             summary_lines.append(f"IQR filter: {metrics['meth_n_before_iqr']} -> {metrics['meth_n_after_iqr']} probes")
         if "median_os_months_km" in metrics:
@@ -2514,12 +2554,13 @@ def main():
 
     logger.info("[STEP 6/8] 加载甲基化数据...")
     try:
-        methylation_df, meth_validation = load_methylation(min_iqr=0.05, use_gain=True)
+        methylation_df, meth_validation = load_methylation(min_iqr=0.05)
         logger.info(f"  甲基化: {methylation_df.shape[0]} 患者 x {methylation_df.shape[1]} 特征")
         if meth_validation:
-            val_keys = [k for k in meth_validation if k.startswith("gain_")]
-            if val_keys:
-                logger.info(f"  GAIN 验证指标: {', '.join(f'{k}={meth_validation[k]}' for k in val_keys)}")
+            _imput_r2 = meth_validation.get("imputation_r_squared", np.nan)
+            logger.info(
+                f"  填补结果: KNN(R²={_imput_r2:.4f})"
+            )
     except (FileNotFoundError, ValueError) as e:
         logger.warning(f"  [WARNING] {e}")
 
