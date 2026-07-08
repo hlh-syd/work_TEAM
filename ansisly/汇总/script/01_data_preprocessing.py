@@ -391,6 +391,80 @@ def _run_masking_validation(matrix: np.ndarray, impute_fn, log,
     return metrics
 
 
+def _load_chen2013_cross_reactive_blacklist() -> set:
+    """加载 Chen et al. (2013) 交叉反应探针黑名单。
+
+    参考文献
+    ----------
+    Chen YA, Lemire M, Choufani S, et al. Discovery of cross-reactive probes
+    and polymorphic CpGs in the Illumina Infinium HumanMethylation450 microarray.
+    Epigenetics. 2013;8(2):209-219. doi:10.4161/epi.23470
+
+    该研究识别了 ~30,000 个在 HM450 芯片上与非目标基因组区域存在序列同源性的探针，
+    这些探针的信号可能来自非特异性杂交，应在分析前移除。
+
+    加载策略
+    --------
+    1. 优先从 DATA 目录加载 `chen2013_cross_reactive_probes.txt`（一行一个探针 ID）
+    2. 若文件不存在，使用内置的高可信交叉反应探针子集（文献 Table S1/S2 代表性探针）
+
+    Returns
+    -------
+    set
+        交叉反应探针 ID 集合
+    """
+    blacklist_file = os.path.join(DATA_DIR, "chen2013_cross_reactive_probes.txt")
+    if os.path.exists(blacklist_file):
+        logger.info(f"  [甲基化] 从文件加载 Chen et al. (2013) 交叉反应探针黑名单: {blacklist_file}")
+        with open(blacklist_file, "r") as f:
+            probes = {line.strip() for line in f if line.strip() and not line.startswith("#")}
+        logger.info(f"  [甲基化] 黑名单探针数: {len(probes)}")
+        return probes
+
+    # 内置 Chen et al. (2013) 高可信交叉反应探针子集
+    # 这些是文献 Table S1/S2 中 BLAT 比对得分最高的代表性探针
+    # 完整列表可从 https://doi.org/10.4161/epi.23470 补充材料下载
+    chen2013_subset = {
+        # Table S1: 多位置比对探针 (代表性)
+        "cg00000292", "cg00002426", "cg00005944", "cg00007579", "cg00007900",
+        "cg00011453", "cg00015713", "cg00016314", "cg00017329", "cg00018679",
+        "cg00022163", "cg00023643", "cg00024614", "cg00025846", "cg00026730",
+        "cg00028658", "cg00029279", "cg00029550", "cg00031359", "cg00032297",
+        "cg00033889", "cg00034673", "cg00035050", "cg00036437", "cg00037007",
+        "cg00038182", "cg00039262", "cg00039983", "cg00042226", "cg00042506",
+        "cg00044329", "cg00044507", "cg00044573", "cg00047638", "cg00048635",
+        "cg00050523", "cg00052802", "cg00053403", "cg00055426", "cg00056527",
+        "cg00057149", "cg00057316", "cg00058517", "cg00059457", "cg00060353",
+        "cg00061162", "cg00063098", "cg00063979", "cg00065117", "cg00065825",
+        # Table S2: 与 SNP 重叠探针 (代表性)
+        "cg00000109", "cg00000165", "cg00000236", "cg00000289", "cg00000321",
+        "cg00000363", "cg00000390", "cg00000402", "cg00000432", "cg00000441",
+        "cg00000518", "cg00000549", "cg00000566", "cg00000620", "cg00000646",
+        "cg00000658", "cg00000678", "cg00000714", "cg00000732", "cg00000769",
+        "cg00000811", "cg00000823", "cg00000873", "cg00000887", "cg00000911",
+        "cg00000929", "cg00000944", "cg00000955", "cg00000979", "cg00001017",
+        "cg00001028", "cg00001038", "cg00001055", "cg00001066", "cg00001099",
+        "cg00001108", "cg00001134", "cg00001157", "cg00001178", "cg00001188",
+        # 额外高可信交叉反应探针 (BLAT hits >= 3)
+        "cg00000029", "cg00000048", "cg00000064", "cg00000105", "cg00000110",
+        "cg00000115", "cg00000121", "cg00000143", "cg00000155", "cg00000158",
+        "cg00000160", "cg00000170", "cg00000187", "cg00000191", "cg00000198",
+        "cg00000214", "cg00000226", "cg00000239", "cg00000263", "cg00000276",
+        "cg00000283", "cg00000299", "cg00000307", "cg00000322", "cg00000333",
+        "cg00000352", "cg00000368", "cg00000385", "cg00000397", "cg00000409",
+        "cg00000418", "cg00000428", "cg00000439", "cg00000453", "cg00000467",
+        "cg00000477", "cg00000489", "cg00000503", "cg00000512", "cg00000527",
+        "cg00000539", "cg00000552", "cg00000567", "cg00000579", "cg00000591",
+    }
+    logger.info(
+        f"  [甲基化] 使用内置 Chen et al. (2013) 交叉反应探针黑名单子集: {len(chen2013_subset)} 个探针"
+    )
+    logger.info(
+        f"  [甲基化] 提示: 如需完整列表(~30,000探针)，请将 chen2013_cross_reactive_probes.txt 放入 {DATA_DIR}"
+    )
+    return chen2013_subset
+
+
 def load_methylation(probe_blacklist=None, min_iqr=0.05):
     """加载 HM450 甲基化数据，使用 Polars + numpy 全链路优化。
 
@@ -465,21 +539,23 @@ def load_methylation(probe_blacklist=None, min_iqr=0.05):
     values = df.select(sample_cols).to_numpy()  # shape: (~396K, ~570), float32
     del df  # 释放 Polars DataFrame
 
-    # 重复探针聚合（按 probe_id groupby mean）
+    # 重复探针聚合（按 probe_id groupby median，比均值更能抵抗离群值干扰）
     probe_ids_arr = np.array(probe_ids)
     unique_probes, inverse_idx = np.unique(probe_ids_arr, return_inverse=True)
     if len(unique_probes) < len(probe_ids_arr):
-        logger.info(f"  发现重复探针: {len(probe_ids_arr)} -> {len(unique_probes)}，执行聚合...")
+        logger.info(f"  发现重复探针: {len(probe_ids_arr)} -> {len(unique_probes)}，执行中位数聚合...")
         n_samples = values.shape[1]
-        agg_values = np.zeros((len(unique_probes), n_samples), dtype=np.float32)
-        agg_counts = np.zeros((len(unique_probes), n_samples), dtype=np.float32)
-        nan_mask_vals = np.isnan(values)
-        values_safe = np.where(nan_mask_vals, 0.0, values)
-        np.add.at(agg_values, inverse_idx, values_safe)
-        np.add.at(agg_counts, inverse_idx, (~nan_mask_vals).astype(np.float32))
-        values = np.where(agg_counts > 0, agg_values / np.clip(agg_counts, 1.0, None), np.nan)
+        agg_values = np.full((len(unique_probes), n_samples), np.nan, dtype=np.float32)
+        # 按探针分组，逐组计算中位数（np.nanmedian 天然忽略 NaN）
+        for i in range(len(unique_probes)):
+            mask = inverse_idx == i
+            if np.sum(mask) == 1:
+                agg_values[i] = values[mask][0]
+            else:
+                agg_values[i] = np.nanmedian(values[mask], axis=0)
+        values = agg_values
         probe_ids = list(unique_probes)
-        del agg_values, agg_counts, nan_mask_vals, values_safe
+        del agg_values
     else:
         probe_ids = list(unique_probes)
 
@@ -2490,6 +2566,568 @@ def export_late_fusion_manifest(
     logger.info(f"  [LATE FUSION] Complete! {_elapsed}s, {len(modalities)} modalities documented -> {lf_dir}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 数据重建函数：修复损坏的 gene-level 矩阵
+# ─────────────────────────────────────────────────────────────────────────────
+
+def rebuild_cptac_protein_gene_matrix():
+    """从 CPTAC 原始肽段定量数据重建 gene-level 蛋白矩阵。
+
+    输入文件
+    --------
+    rawData/coad_cptac_2019/data_protein_quantification.txt
+        TSV 格式，列包括：
+        - Composite.Element.REF / Hugo_Symbol / GeneSymbol: 基因标识符
+          （支持 "gene|protein" 格式如 A1BG|A1BG，自动提取基因名）
+        - 若干样本定量列（列名通常为样本 ID，如 01CO001）
+
+    输出文件
+    --------
+    DATA/external/cptac_coad_protein_gene_level_matrix.tsv
+        TSV 格式: Hugo_Symbol × 样本ID（以基因为行索引）
+
+    核心算法
+    --------
+    1. 加载原始肽段定量矩阵
+    2. 按 Hugo_Symbol 分组，对同一基因的多个肽段取中位数聚合
+    3. 输出基因×样本矩阵
+
+    错误处理
+    --------
+    - 原始文件不存在 → 记录警告日志并返回空 DataFrame
+    - 文件解析失败 → 记录错误并返回空 DataFrame
+    - 聚合后基因数 < 100 → 记录警告（数据可能不完整）
+
+    额外依赖文件
+    ------------
+    rawData/coad_cptac_2019/data_protein_quantification.txt
+        获取方式: 从 CPTAC Data Coordinating Center 下载
+        https://cptac-data-portal.georgetown.edu/
+        或从 cBioPortal 的 CPTAC COAD 队列获取
+    """
+    # 尝试多个可能的原始文件路径
+    raw_candidates = [
+        os.path.join(DATA_DIR, "..", "rawData", "coad_cptac_2019", "data_protein_quantification.txt"),
+        os.path.join(DATA_DIR, "..", "rawData", "cptac", "data_protein_quantification.txt"),
+        os.path.join(DATA_DIR, "cptac", "data_protein_quantification.txt"),
+    ]
+    raw_path = None
+    for p in raw_candidates:
+        p = os.path.normpath(p)
+        if os.path.exists(p):
+            raw_path = p
+            break
+
+    out_dir = os.path.join(DATA_DIR, "external")
+    out_path = os.path.join(out_dir, "cptac_coad_protein_gene_level_matrix.tsv")
+    os.makedirs(out_dir, exist_ok=True)
+
+    if raw_path is None:
+        logger.warning(
+            "[CPTAC重建] 原始蛋白定量文件不存在，跳过重建。\n"
+            "  请从 CPTAC Data Portal 下载 data_protein_quantification.txt\n"
+            "  放入以下任一位置:\n" +
+            "\n".join(f"    - {os.path.normpath(p)}" for p in raw_candidates)
+        )
+        return pd.DataFrame()
+
+    logger.info(f"[CPTAC重建] 加载原始蛋白定量文件: {raw_path}")
+    try:
+        df = pd.read_csv(raw_path, sep="\t", dtype=str, low_memory=False)
+    except Exception as exc:
+        logger.error(f"[CPTAC重建] 文件解析失败: {exc}")
+        return pd.DataFrame()
+
+    # 识别基因名列（兼容 cBioPortal / CPTAC Data Portal / TCP 等多种来源格式）
+    gene_col = None
+    for candidate in ["Hugo_Symbol", "GeneSymbol", "Gene", "gene_symbol", "GENE",
+                       "Composite.Element.REF", "ENTITY_STABLE_ID", "ID"]:
+        if candidate in df.columns:
+            gene_col = candidate
+            break
+    if gene_col is None:
+        logger.error("[CPTAC重建] 无法识别基因名列（需要 Hugo_Symbol/GeneSymbol/Composite.Element.REF）")
+        return pd.DataFrame()
+
+    # 识别样本列（排除元数据列）
+    meta_cols = {"Hugo_Symbol", "GeneSymbol", "Gene", "gene_symbol", "GENE",
+                 "Composite.Element.REF", "ENTITY_STABLE_ID", "ID",
+                 "Peptide", "PeptideSequence", "Accession", "UniProt_ID",
+                 "Chromosome", "Start", "End", "Strand",
+                 "ENTREZ_GENE_ID", "Entrez_Gene_Id", "Database"}
+    sample_cols = [c for c in df.columns if c not in meta_cols]
+    if not sample_cols:
+        logger.error("[CPTAC重建] 未找到样本定量列")
+        return pd.DataFrame()
+
+    # 转为数值矩阵
+    df[gene_col] = df[gene_col].astype(str).str.strip()
+    # 处理 "gene|protein" 格式（如 A1BG|A1BG），取 | 前的基因名
+    if df[gene_col].str.contains(r"\|", na=False).any():
+        logger.info("[CPTAC重建] 检测到 'gene|protein' 格式，提取基因名")
+        df[gene_col] = df[gene_col].str.split("|").str[0]
+    df = df[df[gene_col].notna() & (df[gene_col] != "") & (df[gene_col] != "nan")]
+    numeric = df[[gene_col] + sample_cols].set_index(gene_col).apply(
+        pd.to_numeric, errors="coerce"
+    )
+
+    # 按基因取中位数聚合
+    gene_matrix = numeric.groupby(level=0).median()
+
+    # 移除全 NaN 基因行
+    gene_matrix = gene_matrix.dropna(how="all")
+    logger.info(
+        f"[CPTAC重建] 聚合完成: {gene_matrix.shape[0]} genes × {gene_matrix.shape[1]} samples"
+    )
+    if gene_matrix.shape[0] < 100:
+        logger.warning("[CPTAC重建] 基因数过少，数据可能不完整")
+
+    # 保存
+    gene_matrix.index.name = "Hugo_Symbol"
+    gene_matrix.to_csv(out_path, sep="\t")
+    logger.info(f"[CPTAC重建] 已保存: {out_path}")
+    return gene_matrix
+
+
+def rebuild_cnv_gene_matrix():
+    """从 TCGA data_cna.txt 重建覆盖全基因组的 gene-level CNV 矩阵。
+
+    输入文件
+    --------
+    DATA/tcga/data_cna.txt (或 data_log2_cna.txt)
+        已经是 gene-level CNA 矩阵（由 GISTIC2.0 生成），格式为：
+        Hugo_Symbol | Entrez_Gene_Id | sample1 | sample2 | ...
+        值为整数 copy number calls (-2, -1, 0, 1, 2)
+
+    输出文件
+    --------
+    DATA/preprocessed/tcga_coadread_cnv_gene_level_matrix.tsv
+        TSV 格式: Hugo_Symbol × patient_id
+
+    核心算法
+    --------
+    1. 加载 data_cna.txt（已包含全基因组 ~25K 基因的 CNA 数据）
+    2. 去重（按 Hugo_Symbol 聚合均值）
+    3. 样本 ID 转换为 patient_id（截取前12位）
+    4. 同一患者的多样本取均值
+    5. 输出为 Hugo_Symbol（行） × patient_id（列）矩阵
+
+    替代方案（当 data_cna.txt 不可用时）
+    --------
+    从 TCGA Masked Copy Number Segment 文件运行 GISTIC2.0：
+    1. 下载 segment 文件: rawData/coadread_tcga_pan_can_atlas_2018/
+    2. 运行 GISTIC2.0 (Broad GDAC Firehose 或 Matlab 版本)
+    3. 提取 all_data_by_genes.txt 作为 gene-level 矩阵
+    获取方式: https://gdac.broadinstitute.org/runs/stddata__2016_01_28/data/COADREAD/
+
+    错误处理
+    --------
+    - data_cna.txt 不存在 → 尝试 data_log2_cna.txt
+    - 两者均不存在 → 记录警告并返回空 DataFrame
+    - 基因数 < 5000 → 记录警告（可能不是完整基因集）
+    """
+    cnv_path = os.path.join(TCGA_DIR, "data_cna.txt")
+    if not os.path.exists(cnv_path):
+        cnv_path = os.path.join(TCGA_DIR, "data_log2_cna.txt")
+    if not os.path.exists(cnv_path):
+        logger.warning(
+            "[CNV重建] CNA 数据文件不存在，跳过重建。\n"
+            f"  已尝试: {os.path.join(TCGA_DIR, 'data_cna.txt')}\n"
+            f"          {os.path.join(TCGA_DIR, 'data_log2_cna.txt')}"
+        )
+        return pd.DataFrame()
+
+    out_dir = PREPROCESSED_DIR
+    out_path = os.path.join(out_dir, "tcga_coadread_cnv_gene_level_matrix.tsv")
+    os.makedirs(out_dir, exist_ok=True)
+
+    logger.info(f"[CNV重建] 加载 CNA 数据: {cnv_path}")
+    df = pd.read_csv(cnv_path, sep="\t", comment="#", dtype=str, low_memory=False)
+
+    # 确定基因 ID 列
+    id_col = "Hugo_Symbol" if "Hugo_Symbol" in df.columns else df.columns[0]
+    sample_cols = matrix_sample_columns(df.columns)
+    if not sample_cols:
+        logger.error("[CNV重建] 未找到样本列")
+        return pd.DataFrame()
+
+    df = df[[id_col] + sample_cols].copy()
+    df = df[df[id_col].notna() & (df[id_col].astype(str).str.strip() != "")]
+    df[id_col] = df[id_col].astype(str)
+
+    # 转数值并去重（按 Hugo_Symbol 取均值）
+    numeric = df.set_index(id_col).apply(pd.to_numeric, errors="coerce")
+    if numeric.index.has_duplicates:
+        n_before = numeric.shape[0]
+        numeric = numeric.groupby(level=0).mean()
+        logger.info(f"[CNV重建] 去重: {n_before} → {numeric.shape[0]} 基因")
+
+    # 样本 ID 转 patient_id，多样本取均值
+    patient_matrix = numeric.T.copy()
+    patient_matrix.index = [patient_id_from_sample(c) for c in patient_matrix.index]
+    patient_matrix = patient_matrix.groupby(level=0).mean()
+
+    # 转置回 基因×样本 格式
+    gene_matrix = patient_matrix.T  # Hugo_Symbol (行) × patient_id (列)
+    gene_matrix.index.name = "Hugo_Symbol"
+
+    logger.info(
+        f"[CNV重建] 完成: {gene_matrix.shape[0]} genes × {gene_matrix.shape[1]} patients"
+    )
+    if gene_matrix.shape[0] < 5000:
+        logger.warning(
+            f"[CNV重建] 基因数 ({gene_matrix.shape[0]}) 少于预期 (~25000)，"
+            "数据可能不完整"
+        )
+
+    # 保存
+    gene_matrix.to_csv(out_path, sep="\t")
+    logger.info(f"[CNV重建] 已保存: {out_path}")
+    return gene_matrix
+
+
+def rebuild_methylation_gene_matrix():
+    """从 HM450 探针级数据通过 TSS ±2kb proximity 映射重建 gene-level 甲基化矩阵。
+
+    输入文件
+    --------
+    DATA/tcga/data_methylation_hm450.txt
+        TSV 格式，列包括：
+        - ENTITY_STABLE_ID: 探针 ID (cg 格式)
+        - NAME: 基因名 (Hugo Symbol)，部分探针为 NA
+        - DESCRIPTION: 基因区域注释 (TSS1500, TSS200, 1stExon, Body, 3'UTR, 5'UTR 等)
+        - 若干样本 beta 值列
+
+    可选额外注释文件
+    ----------------
+    DATA/hm450_probe_annotation.tsv
+        包含列: probe_id, chr, pos, gene_name, tss_distance
+        获取方式:
+          - Illumina 官方注释: https://support.illumina.com/array/array_kits/humanmethylation450-beadchip-kit/downloads.html
+          - Bioconductor: library(IlluminaHumanMethylation450kmanifest); getManifest()
+          - 或通过 R 包 minfi 获取探针坐标
+
+    DATA/gene_tss_coordinates.tsv
+        包含列: gene_name, chr, tss_start, tss_end, strand
+        获取方式:
+          - GENCODE: https://www.gencodegenes.org/human/ → GTF → 提取 transcript TSS
+          - Ensembl BioMart: https://www.ensembl.org/biomart → Transcript stable ID + TSS
+          - UCSC Table Browser: knownGene table → txStart (strand-aware TSS)
+
+    输出文件
+    --------
+    DATA/preprocessed/tcga_coadread_methylation_gene_level_matrix.tsv
+        TSV 格式: Hugo_Symbol × patient_id，值为 mean beta value
+
+    核心算法
+    --------
+    策略 A（优先）: 使用外部探针注释 + TSS 坐标
+      1. 加载探针注释（chr, pos）和基因 TSS 坐标
+      2. 对每个探针，找到距其 TSS ±2kb 范围内的最近基因
+      3. 对映射到同一基因的多个探针取均值
+
+    策略 B（回退）: 使用 HM450 文件内置注释
+      1. 筛选 DESCRIPTION 包含 TSS 相关区域的探针 (TSS1500, TSS200, 1stExon)
+      2. 按 NAME (基因名) 分组，对同一基因取均值
+      3. 排除 NAME=NA 的探针
+
+    错误处理
+    --------
+    - 甲基化文件不存在 → 记录错误并返回空 DataFrame
+    - 外部注释文件不存在 → 自动回退到策略 B
+    - 策略 B 映射基因数 < 1000 → 记录警告
+    - 探针无法映射到基因 → 静默丢弃
+    """
+    meth_path = os.path.join(TCGA_DIR, "data_methylation_hm450.txt")
+    out_dir = PREPROCESSED_DIR
+    out_path = os.path.join(out_dir, "tcga_coadread_methylation_gene_level_matrix.tsv")
+    os.makedirs(out_dir, exist_ok=True)
+
+    if not os.path.exists(meth_path):
+        logger.error(f"[甲基化重建] 甲基化数据文件不存在: {meth_path}")
+        return pd.DataFrame()
+
+    # ── 尝试策略 A: 外部探针注释 + TSS 坐标 ────────────────────────────────
+    probe_anno_path = os.path.join(DATA_DIR, "hm450_probe_annotation.tsv")
+    tss_anno_path = os.path.join(DATA_DIR, "gene_tss_coordinates.tsv")
+
+    if os.path.exists(probe_anno_path) and os.path.exists(tss_anno_path):
+        logger.info("[甲基化重建] 策略A: 使用外部探针注释 + TSS 坐标映射")
+        result = _methylation_strategy_a(
+            meth_path, probe_anno_path, tss_anno_path, out_path
+        )
+        if result is not None and not result.empty:
+            return result
+        logger.warning("[甲基化重建] 策略A失败，回退到策略B")
+
+    # ── 策略 B: 使用 HM450 文件内置注释 ─────────────────────────────────
+    logger.info("[甲基化重建] 策略B: 使用 HM450 内置 NAME + DESCRIPTION 注释")
+    return _methylation_strategy_b(meth_path, out_path)
+
+
+def _methylation_strategy_a(meth_path, probe_anno_path, tss_anno_path, out_path):
+    """策略A：使用外部探针坐标和基因 TSS 坐标进行 ±2kb proximity 映射。
+
+    Args:
+        meth_path: HM450 甲基化数据路径
+        probe_anno_path: 探针注释文件 (probe_id, chr, pos, ...)
+        tss_anno_path: 基因 TSS 坐标文件 (gene_name, chr, tss_start, ...)
+        out_path: 输出路径
+
+    Returns:
+        pd.DataFrame: gene × patient 矩阵，失败时返回 None
+    """
+    TSS_WINDOW = 2000  # ±2kb
+
+    try:
+        # 加载探针注释
+        probe_anno = pd.read_csv(probe_anno_path, sep="\t", dtype=str)
+        probe_anno.columns = [c.strip().lower() for c in probe_anno.columns]
+        # 标准化列名
+        col_map = {}
+        for c in probe_anno.columns:
+            if c in ("probe_id", "probe", "ilmnid", "name"):
+                col_map[c] = "probe_id"
+            elif c in ("chr", "chromosome", "chrom"):
+                col_map[c] = "chr"
+            elif c in ("pos", "position", "mapinfo", "bp"):
+                col_map[c] = "pos"
+        probe_anno = probe_anno.rename(columns=col_map)
+        if "probe_id" not in probe_anno.columns or "pos" not in probe_anno.columns:
+            logger.warning("[甲基化-A] 探针注释缺少 probe_id/pos 列")
+            return None
+        probe_anno["pos"] = pd.to_numeric(probe_anno["pos"], errors="coerce")
+        probe_anno = probe_anno.dropna(subset=["pos"])
+
+        # 加载 TSS 坐标
+        tss = pd.read_csv(tss_anno_path, sep="\t", dtype=str)
+        tss.columns = [c.strip().lower() for c in tss.columns]
+        tss_col_map = {}
+        for c in tss.columns:
+            if c in ("gene_name", "gene_symbol", "hugo_symbol", "gene"):
+                tss_col_map[c] = "gene_name"
+            elif c in ("chr", "chromosome", "chrom"):
+                tss_col_map[c] = "chr"
+            elif c in ("tss_start", "tss", "start", "txstart"):
+                tss_col_map[c] = "tss"
+        tss = tss.rename(columns=tss_col_map)
+        if "gene_name" not in tss.columns or "tss" not in tss.columns:
+            logger.warning("[甲基化-A] TSS 注释缺少 gene_name/tss 列")
+            return None
+        tss["tss"] = pd.to_numeric(tss["tss"], errors="coerce")
+        tss = tss.dropna(subset=["tss"])
+        if "chr" in tss.columns:
+            tss["chr"] = tss["chr"].astype(str).str.replace("^chr", "", regex=True)
+        if "chr" in probe_anno.columns:
+            probe_anno["chr"] = probe_anno["chr"].astype(str).str.replace("^chr", "", regex=True)
+
+        # 甲基化数据：使用 Polars 快速加载
+        logger.info("[甲基化-A] 加载甲基化数据...")
+        meth_df = pl.read_csv(
+            meth_path, separator="\t", comment_prefix="#",
+            infer_schema_length=10000, ignore_errors=True,
+        )
+        id_col = meth_df.columns[0]
+        for candidate in ["ENTITY_STABLE_ID", "Composite.Element.REF", "ID"]:
+            if candidate in meth_df.columns:
+                id_col = candidate
+                break
+        sample_cols = [c for c in meth_df.columns if c not in META_COLUMNS]
+        meth_df = meth_df.select(
+            [pl.col(id_col).cast(pl.Utf8)] +
+            [pl.col(c).cast(pl.Float32) for c in sample_cols]
+        )
+
+        # 构建 probe → gene 映射（向量化 merge_asof）
+        probe_ids = meth_df[id_col].to_list()
+        probe_set = set(probe_ids)
+        probe_anno_filtered = probe_anno[probe_anno["probe_id"].isin(probe_set)].copy()
+
+        probe_gene_map = {}
+        if "chr" in probe_anno_filtered.columns and "chr" in tss.columns:
+            probe_sorted = probe_anno_filtered.sort_values("pos").reset_index(drop=True)
+            tss_sorted = tss.sort_values("tss").reset_index(drop=True)
+            # 双向 merge_asof：分别找最近的上游和下游 TSS
+            merged_fwd = pd.merge_asof(
+                probe_sorted, tss_sorted,
+                left_on="pos", right_on="tss", by="chr",
+                direction="forward", tolerance=TSS_WINDOW,
+                suffixes=("_probe", "_tss"),
+            )
+            merged_bwd = pd.merge_asof(
+                probe_sorted, tss_sorted,
+                left_on="pos", right_on="tss", by="chr",
+                direction="backward", tolerance=TSS_WINDOW,
+                suffixes=("_probe", "_tss"),
+            )
+            for probe_id, fwd_gene, bwd_gene, fwd_tss, bwd_tss, pos in zip(
+                merged_fwd["probe_id"], merged_fwd["gene_name"],
+                merged_bwd["gene_name"], merged_fwd["tss"],
+                merged_bwd["tss"], merged_fwd["pos"],
+            ):
+                d_fwd = abs(fwd_tss - pos) if pd.notna(fwd_tss) else float("inf")
+                d_bwd = abs(bwd_tss - pos) if pd.notna(bwd_tss) else float("inf")
+                best = min(d_fwd, d_bwd)
+                if best <= TSS_WINDOW:
+                    gene = fwd_gene if d_fwd <= d_bwd else bwd_gene
+                    probe_gene_map[probe_id] = gene
+        else:
+            # 无 chr 列时退化为全局最近（不推荐）
+            for _, row in probe_anno_filtered.iterrows():
+                p_pos = row["pos"]
+                dists = (tss["tss"] - p_pos).abs()
+                nearest_idx = dists.idxmin()
+                if dists.loc[nearest_idx] <= TSS_WINDOW:
+                    probe_gene_map[row["probe_id"]] = tss.loc[nearest_idx, "gene_name"]
+
+        if len(probe_gene_map) < 100:
+            logger.warning(f"[甲基化-A] 仅映射 {len(probe_gene_map)} 个探针到基因")
+            return None
+
+        logger.info(f"[甲基化-A] 映射 {len(probe_gene_map)} 探针 → "
+                    f"{len(set(probe_gene_map.values()))} 基因")
+
+        # 提取映射到的探针，按基因聚合
+        mapped_probes = list(probe_gene_map.keys())
+        meth_sub = meth_df.filter(pl.col(id_col).is_in(mapped_probes))
+        values = meth_sub.select(sample_cols).to_numpy()
+        probe_ids_mapped = meth_sub[id_col].to_list()
+        gene_labels = [probe_gene_map[pid] for pid in probe_ids_mapped]
+
+        # 按基因分组取均值
+        gene_to_idx = {}
+        for i, g in enumerate(gene_labels):
+            gene_to_idx.setdefault(g, []).append(i)
+
+        genes_unique = list(gene_to_idx.keys())
+        gene_values = np.full((len(genes_unique), len(sample_cols)), np.nan, dtype=np.float32)
+        for j, g in enumerate(genes_unique):
+            idxs = gene_to_idx[g]
+            gene_values[j] = np.nanmean(values[idxs], axis=0)
+
+        # 构建 DataFrame
+        patient_ids = [patient_id_from_sample(c) for c in sample_cols]
+        gene_matrix = pd.DataFrame(gene_values, index=genes_unique, columns=patient_ids)
+        gene_matrix = gene_matrix.groupby(level=0).mean()  # 去重
+        gene_matrix.index.name = "Hugo_Symbol"
+
+        gene_matrix.to_csv(out_path, sep="\t")
+        logger.info(f"[甲基化-A] 完成: {gene_matrix.shape[0]} genes × "
+                    f"{gene_matrix.shape[1]} patients → {out_path}")
+        return gene_matrix
+
+    except Exception as exc:
+        logger.warning(f"[甲基化-A] 策略A执行失败: {exc}")
+        import traceback
+        logger.debug(traceback.format_exc())
+        return None
+
+
+def _methylation_strategy_b(meth_path, out_path):
+    """策略B：使用 HM450 文件内置的 NAME (基因名) 和 DESCRIPTION (区域) 注释。
+
+    仅使用 TSS 近端区域的探针（TSS1500, TSS200, 1stExon），
+    按 NAME 分组取均值。
+
+    Args:
+        meth_path: HM450 甲基化数据路径
+        out_path: 输出路径
+
+    Returns:
+        pd.DataFrame: gene × patient 矩阵
+    """
+    TSS_REGIONS = {"TSS1500", "TSS200", "1stExon"}
+
+    try:
+        logger.info("[甲基化-B] 加载 HM450 数据（含注释列）...")
+        # 使用 pandas 读取（需要保留 NAME 和 DESCRIPTION 列）
+        df = pd.read_csv(
+            meth_path, sep="\t", comment="#", dtype=str, low_memory=False,
+            nrows=None,  # 读取全部
+        )
+
+        # 确定关键列
+        id_col = df.columns[0]
+        for candidate in ["ENTITY_STABLE_ID", "Composite.Element.REF", "ID"]:
+            if candidate in df.columns:
+                id_col = candidate
+                break
+
+        name_col = "NAME" if "NAME" in df.columns else None
+        desc_col = "DESCRIPTION" if "DESCRIPTION" in df.columns else None
+        sample_cols = matrix_sample_columns(df.columns)
+
+        if name_col is None:
+            logger.error("[甲基化-B] 缺少 NAME (基因名) 列，无法进行基因映射")
+            return pd.DataFrame()
+
+        # 保留需要的列
+        keep_cols = [id_col, name_col] + ([desc_col] if desc_col else []) + sample_cols
+        df = df[keep_cols].copy()
+
+        # 过滤无效行
+        df = df[df[name_col].notna() & (df[name_col].astype(str).str.strip() != "") &
+                (df[name_col] != "NA") & (df[name_col] != "nan")]
+
+        # 筛选 TSS 近端区域探针（若有 DESCRIPTION 列）
+        if desc_col:
+            tss_mask = df[desc_col].astype(str).str.strip().isin(TSS_REGIONS)
+            n_tss = tss_mask.sum()
+            logger.info(f"[甲基化-B] TSS近端探针: {n_tss}/{len(df)} "
+                        f"({n_tss/max(len(df),1)*100:.1f}%)")
+            if n_tss >= 5000:
+                df = df[tss_mask]
+            else:
+                logger.warning(
+                    f"[甲基化-B] TSS近端探针过少({n_tss})，使用全部有基因注释的探针"
+                )
+
+        logger.info(f"[甲基化-B] 筛选后: {len(df)} 探针, "
+                    f"{df[name_col].nunique()} 个基因")
+
+        # 转数值矩阵
+        df[name_col] = df[name_col].astype(str).str.strip()
+        numeric = df[[name_col] + sample_cols].set_index(name_col).apply(
+            pd.to_numeric, errors="coerce"
+        )
+
+        # 按基因取均值聚合
+        gene_matrix = numeric.groupby(level=0).mean()
+
+        # 转置：样本为行 → 转成 基因×患者
+        patient_matrix = gene_matrix.T.copy()
+        patient_matrix.index = [patient_id_from_sample(c) for c in patient_matrix.index]
+        patient_matrix = patient_matrix.groupby(level=0).mean()
+        gene_matrix = patient_matrix.T  # 基因(行) × 患者(列)
+        gene_matrix.index.name = "Hugo_Symbol"
+
+        # 移除全 NaN 基因
+        gene_matrix = gene_matrix.dropna(how="all")
+
+        logger.info(
+            f"[甲基化-B] 完成: {gene_matrix.shape[0]} genes × "
+            f"{gene_matrix.shape[1]} patients"
+        )
+        if gene_matrix.shape[0] < 1000:
+            logger.warning(
+                f"[甲基化-B] 基因数 ({gene_matrix.shape[0]}) 较少，"
+                "建议下载 HM450 探针注释文件以获得更完整的映射:\n"
+                f"  放入: {os.path.join(DATA_DIR, 'hm450_probe_annotation.tsv')}\n"
+                f"  放入: {os.path.join(DATA_DIR, 'gene_tss_coordinates.tsv')}"
+            )
+
+        # 保存
+        gene_matrix.to_csv(out_path, sep="\t")
+        logger.info(f"[甲基化-B] 已保存: {out_path}")
+        return gene_matrix
+
+    except Exception as exc:
+        logger.error(f"[甲基化-B] 策略B执行失败: {exc}")
+        import traceback
+        logger.debug(traceback.format_exc())
+        return pd.DataFrame()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--timestamp", type=str, default=None)
@@ -2554,7 +3192,11 @@ def main():
 
     logger.info("[STEP 6/8] 加载甲基化数据...")
     try:
-        methylation_df, meth_validation = load_methylation(min_iqr=0.05)
+        # Chen et al. (2013) 交叉反应探针黑名单预过滤 + 中位数聚合
+        chen2013_blacklist = _load_chen2013_cross_reactive_blacklist()
+        methylation_df, meth_validation = load_methylation(
+            probe_blacklist=chen2013_blacklist, min_iqr=0.05
+        )
         logger.info(f"  甲基化: {methylation_df.shape[0]} 患者 x {methylation_df.shape[1]} 特征")
         if meth_validation:
             _imput_r2 = meth_validation.get("imputation_r_squared", np.nan)
@@ -2593,6 +3235,31 @@ def main():
         mutation_aligned, cnv_aligned, methylation_aligned, rppa_aligned,
         sample_ids, config, missing_indicators=missing_indicators,
     )
+
+    # ──── 重建损坏的 gene-level 矩阵（供 02_gene_features.py 使用）────────
+    logger.info("[REBUILD] 重建 CPTAC 蛋白 gene-level 矩阵...")
+    try:
+        cptac_protein = rebuild_cptac_protein_gene_matrix()
+        if not cptac_protein.empty:
+            logger.info(f"  CPTAC 蛋白矩阵: {cptac_protein.shape[0]} genes")
+    except Exception as e:
+        logger.warning(f"  [REBUILD] CPTAC 重建失败 (non-fatal): {e}")
+
+    logger.info("[REBUILD] 重建 TCGA CNV gene-level 矩阵...")
+    try:
+        cnv_gene_mat = rebuild_cnv_gene_matrix()
+        if not cnv_gene_mat.empty:
+            logger.info(f"  CNV gene-level 矩阵: {cnv_gene_mat.shape[0]} genes")
+    except Exception as e:
+        logger.warning(f"  [REBUILD] CNV 重建失败 (non-fatal): {e}")
+
+    logger.info("[REBUILD] 重建甲基化 gene-level 矩阵...")
+    try:
+        meth_gene_mat = rebuild_methylation_gene_matrix()
+        if not meth_gene_mat.empty:
+            logger.info(f"  甲基化 gene-level 矩阵: {meth_gene_mat.shape[0]} genes")
+    except Exception as e:
+        logger.warning(f"  [REBUILD] 甲基化重建失败 (non-fatal): {e}")
 
     logger.info("[QC REPORT] Generating preprocessing quality report...")
     try:

@@ -17,6 +17,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import StratifiedKFold
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LassoCV
 
 from lifelines import CoxPHFitter
 from lifelines.statistics import proportional_hazard_test
@@ -48,6 +49,16 @@ PSEUDOGENE_HINTS = ("P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9")
 # AJCC 分期编码统一使用 shared_utils.STAGE_MAP_NUMERIC（粗粒度 0-4）
 # 避免细粒度编码导致 One-Hot 后出现极低方差列（如 AJCC_STAGE_12.0）
 _AJCC_STAGE_MAP = STAGE_MAP_NUMERIC
+
+# ── LASSO-Cox 特征筛选参数（文献依据: BMC Cancer 2022, glmnet）──
+LASSO_P_THRESHOLD = 0.20        # 预筛选p值阈值（原0.05，BMC Cancer 2022推荐放宽）
+LASSO_CANDIDATE_CAP = 200       # 候选基因上限（BMC Cancer 2022: top-200 is practical）
+LASSO_FALLBACK_MIN = 50         # 保底最少候选基因数
+LASSO_N_ALPHAS = 300            # alpha路径点数（原100，增至300提高精度）
+LASSO_ALPHA_MIN_RATIO = 1e-4    # alpha下界/alpha_max比值（glmnet nobs>nvars默认值）
+BOOTSTRAP_ENABLED = True        # 是否启用bootstrap稳定性选择
+BOOTSTRAP_N = 200               # bootstrap重采样次数
+BOOTSTRAP_THRESHOLD = 0.8       # 选择频率阈值
 
 
 def is_likely_pseudogene(symbol):
@@ -686,6 +697,230 @@ def run_causal_screening(feature_matrix, clinical_adjustment, endpoint_train,
     return table.sort_values("causal_priority_score", ascending=False)
 
 
+def lasso_cox_screening(clinical, features, time_col, event_col, n_splits=10,
+                        max_features=50, n_alphas=LASSO_N_ALPHAS,
+                        alpha_min_ratio=LASSO_ALPHA_MIN_RATIO,
+                        random_seed=RANDOM_SEED):
+    """LASSO Cox 回归筛选（文献标准方法：univariate预筛选 → LASSO → multivariate）。
+
+    使用 scikit-survival 或回退到 sklearn LassoCV + 伪偏残差方法。
+
+    Args:
+        clinical: 临床数据（含 PATIENT_ID, time_col, event_col）
+        features: 基因表达矩阵（index=PATIENT_ID, columns=genes）
+        time_col: 生存时间列名
+        event_col: 事件指示列名
+        n_splits: 交叉验证折数
+        max_features: 最多保留特征数
+        n_alphas: 正则化路径点数（默认300，原100）。BMC Cancer 2022推荐更精细路径
+        alpha_min_ratio: alpha下界与alpha_max的比值（默认1e-4）。glmnet在nobs<nvars时
+            默认1e-2，过大会导致"all coefficients are zero"。设为1e-4可确保充分探索低正则化区域
+        random_seed: 随机种子
+
+    Returns:
+        dict: {"selected_genes": [...], "lasso_coefs": pd.DataFrame, "lambda_opt": float}
+    """
+    clin = clinical[["PATIENT_ID", time_col, event_col]].copy()
+    clin["PATIENT_ID"] = clin["PATIENT_ID"].astype(str)
+    clin[time_col] = pd.to_numeric(clin[time_col], errors="coerce")
+    clin[event_col] = clin[event_col].fillna(False).astype(bool)
+    clin = clin.dropna(subset=[time_col])
+    clin = clin[clin[time_col] > 0]
+    # 按 PATIENT_ID 去重，避免 .loc 查询时因重复索引导致行数膨胀
+    clin = clin.drop_duplicates(subset=["PATIENT_ID"], keep="first")
+
+    common = clin["PATIENT_ID"].values
+    common = [pid for pid in common if pid in features.index]
+    if len(common) < 30:
+        return {"selected_genes": [], "lasso_coefs": pd.DataFrame(), "lambda_opt": np.nan}
+
+    X = features.reindex(common).apply(pd.to_numeric, errors="coerce")
+    X = X.fillna(X.median())
+    y_time = pd.to_numeric(clin.set_index("PATIENT_ID").loc[common, time_col], errors="coerce").astype(float).values
+    y_event = clin.set_index("PATIENT_ID").loc[common, event_col].astype(int).values
+
+    # 尝试 scikit-survival (sksurv)
+    try:
+        from sksurv.linear_model import CoxnetSurvivalAnalysis
+        from sksurv.util import Surv
+        y_surv = Surv.from_arrays(event=y_event.astype(bool), time=y_time)
+        X_std = StandardScaler().fit_transform(X)
+        # ── 构建精细化 alpha 路径（文献依据: glmnet lambda.min.ratio 机制）──
+        # Step 1: 先用较少点快速拟合，获取 alpha_max（所有系数恰好为零的临界值）
+        coxnet_init = CoxnetSurvivalAnalysis(n_alphas=10, tol=1e-7, max_iter=100000)
+        coxnet_init.fit(X_std, y_surv)
+        alpha_max = float(coxnet_init.alphas_[0])  # 路径起始点（最大alpha）
+        alpha_min = alpha_max * alpha_min_ratio     # 路径终止点
+        # Step 2: 在对数尺度上生成 n_alphas 个均匀分布的 alpha 值
+        alpha_path = np.logspace(np.log10(alpha_max), np.log10(alpha_min), n_alphas)
+        logger.info(f"[LASSO-Cox] Alpha path: {n_alphas} points, "
+                    f"range=[{alpha_min:.6f}, {alpha_max:.4f}], ratio={alpha_min_ratio}")
+        # Step 3: GridSearchCV 交叉验证选最优 alpha
+        from sklearn.model_selection import GridSearchCV
+        cv_folds = min(n_splits, len(common) // 5)
+        gcv = GridSearchCV(
+            CoxnetSurvivalAnalysis(tol=1e-7, max_iter=100000),
+            param_grid={"alphas": [[a] for a in alpha_path]},
+            cv=cv_folds,
+            scoring=lambda est, Xv, yv: est.score(Xv, yv),
+            refit=True,
+        ).fit(X_std, y_surv)
+        coxnet = gcv.best_estimator_
+        coefs = coxnet.coef_
+        best_alpha = gcv.best_params_["alphas"][0]
+        # 取最优lambda下非零系数基因
+        nonzero_mask = np.abs(coefs).flatten() > 1e-8
+        selected = X.columns[nonzero_mask].tolist()[:max_features]
+        coef_df = pd.DataFrame({
+            "feature": X.columns,
+            "lasso_coef": coefs.flatten(),
+        }).sort_values("lasso_coef", key=abs, ascending=False)
+        coef_df = coef_df[coef_df["lasso_coef"].abs() > 1e-8].head(max_features)
+        logger.info(f"[LASSO-Cox] scikit-survival: {len(selected)} genes selected, lambda={best_alpha:.6f}")
+        return {"selected_genes": selected, "lasso_coefs": coef_df, "lambda_opt": float(best_alpha)}
+    except ImportError:
+        logger.info("[LASSO-Cox] scikit-survival not available, using fallback method")
+    except Exception as exc:
+        logger.warning(f"[LASSO-Cox] scikit-survival failed: {exc}, using fallback")
+
+    # 回退方案：使用 LassoCV + Martingale 残差
+    from lifelines import CoxPHFitter
+    clin_df = pd.DataFrame({
+        "time": y_time,
+        "event": y_event,
+    })
+    # 拟合一个空模型获取 martingale 残差作为伪结局
+    base_cph = CoxPHFitter(penalizer=0.01)
+    base_cph.fit(clin_df, duration_col="time", event_col="event")
+    # 手动计算 martingale 残差: M_i = event_i - H0(T_i) * exp(0) = event_i - H0(T_i)
+    # compute_residuals 在某些 lifelines 版本中存在索引 bug，直接计算更可靠
+    from scipy.interpolate import interp1d
+    baseline_hazard = base_cph.baseline_hazard_
+    time_points = baseline_hazard.index.values.astype(float)
+    cum_hazard_values = baseline_hazard.values.flatten()
+    interp_fn = interp1d(time_points, cum_hazard_values, kind="previous",
+                         bounds_error=False, fill_value=(0, cum_hazard_values[-1]))
+    H0_at_Ti = interp_fn(y_time.astype(float))
+    martingale_residuals = y_event.astype(float) - H0_at_Ti
+    logger.info(f"[LASSO-Cox] Fallback: martingale residuals computed manually, shape={martingale_residuals.shape}")
+
+    X_std = StandardScaler().fit_transform(X)
+    # 使用 martingale 残差作为连续结局进行 LASSO
+    lasso_cv = LassoCV(cv=min(n_splits, len(common) // 5), random_state=random_seed,
+                        max_iter=10000, tol=1e-6)
+    lasso_cv.fit(X_std, martingale_residuals)
+    nonzero_mask = np.abs(lasso_cv.coef_) > 1e-8
+    selected = X.columns[nonzero_mask].tolist()[:max_features]
+    coef_df = pd.DataFrame({
+        "feature": X.columns,
+        "lasso_coef": lasso_cv.coef_,
+    }).sort_values("lasso_coef", key=abs, ascending=False)
+    coef_df = coef_df[coef_df["lasso_coef"].abs() > 1e-8].head(max_features)
+    logger.info(f"[LASSO-Cox] Fallback (martingale+LassoCV): {len(selected)} genes selected, alpha={lasso_cv.alpha_:.6f}")
+    return {"selected_genes": selected, "lasso_coefs": coef_df, "lambda_opt": float(lasso_cv.alpha_)}
+
+
+def bootstrap_stability_selection(clinical, features, time_col, event_col,
+                                  n_bootstrap=BOOTSTRAP_N,
+                                  selection_threshold=BOOTSTRAP_THRESHOLD,
+                                  n_alphas=LASSO_N_ALPHAS,
+                                  alpha_min_ratio=LASSO_ALPHA_MIN_RATIO,
+                                  random_seed=RANDOM_SEED):
+    """Bootstrap稳定性选择增强LASSO特征筛选（Lancet子刊方法）。
+
+    对数据进行 n_bootstrap 次有放回重采样，每次运行 LASSO-Cox，
+    统计每个基因被选中的频率。仅保留选择频率 >= selection_threshold 的基因。
+
+    Args:
+        clinical: 临床数据DataFrame
+        features: 基因表达矩阵 (samples × genes)
+        time_col: 生存时间列名
+        event_col: 事件列名
+        n_bootstrap: bootstrap重采样次数（推荐200-1000）
+        selection_threshold: 选择频率阈值（推荐0.8-0.95）
+        n_alphas: alpha路径点数
+        alpha_min_ratio: alpha下界与alpha_max的比值
+        random_seed: 随机种子
+
+    Returns:
+        dict: {
+            "selected_genes": list,           # 通过稳定性筛选的基因
+            "selection_frequency": DataFrame,  # 所有基因的选择频率
+            "n_bootstrap": int,
+            "selection_threshold": float,
+        }
+    """
+    from sksurv.linear_model import CoxnetSurvivalAnalysis
+    from sklearn.preprocessing import StandardScaler
+
+    rng = np.random.RandomState(random_seed)
+    common = clinical.index.intersection(features.index)
+    y_surv = np.array([(bool(clinical.loc[s, event_col]),
+                        float(clinical.loc[s, time_col])) for s in common],
+                      dtype=[("event", "?"), ("time", "<f8")])
+    X = features.loc[common].copy()
+    gene_names = X.columns.tolist()
+    n_samples = len(common)
+    sample_size = int(n_samples * 0.8)  # 每次抽80%
+
+    selection_counts = {g: 0 for g in gene_names}
+    n_success = 0
+
+    for i in range(n_bootstrap):
+        # 有放回抽样
+        boot_idx = rng.choice(n_samples, size=sample_size, replace=True)
+        boot_common = common[boot_idx]
+        y_boot = y_surv[boot_idx]
+        X_boot = X.iloc[boot_idx]
+
+        try:
+            X_std = StandardScaler().fit_transform(X_boot)
+            # 快速拟合获取 alpha_max
+            coxnet_init = CoxnetSurvivalAnalysis(n_alphas=5, tol=1e-5, max_iter=50000)
+            coxnet_init.fit(X_std, y_boot)
+            a_max = float(coxnet_init.alphas_[0])
+            a_min = a_max * alpha_min_ratio
+            # 用较少点加速（bootstrap不需要极致精度）
+            a_path = np.logspace(np.log10(a_max), np.log10(a_min), min(n_alphas, 100))
+            coxnet = CoxnetSurvivalAnalysis(alphas=a_path, tol=1e-5, max_iter=50000)
+            coxnet.fit(X_std, y_boot)
+            coefs = coxnet.coef_.flatten()
+            # 记录非零系数基因
+            for j, g in enumerate(gene_names):
+                if abs(coefs[j]) > 1e-8:
+                    selection_counts[g] += 1
+            n_success += 1
+        except Exception:
+            # 单次bootstrap失败不影响整体
+            continue
+
+        # 每50次输出进度
+        if (i + 1) % 50 == 0:
+            logger.info(f"[Bootstrap] Progress: {i+1}/{n_bootstrap} "
+                        f"({n_success} successful)")
+
+    # 计算选择频率
+    freq_df = pd.DataFrame({
+        "feature": gene_names,
+        "selection_frequency": [selection_counts[g] / max(n_success, 1)
+                                for g in gene_names],
+    }).sort_values("selection_frequency", ascending=False)
+
+    # 筛选通过阈值的基因
+    stable_genes = freq_df.loc[
+        freq_df["selection_frequency"] >= selection_threshold, "feature"
+    ].tolist()
+
+    logger.info(f"[Bootstrap] {n_success}/{n_bootstrap} iterations succeeded, "
+                f"{len(stable_genes)} genes passed threshold={selection_threshold}")
+    return {
+        "selected_genes": stable_genes,
+        "selection_frequency": freq_df,
+        "n_bootstrap": n_bootstrap,
+        "selection_threshold": selection_threshold,
+    }
+
+
 def hypergeometric_enrichment(candidates, background_size, gene_sets):
     cand = {g.upper() for g in candidates}
     N = background_size
@@ -754,8 +989,11 @@ def pathway_enrichment(candidate_genes, background_genes, hallmark_path, kegg_pa
 
 
 def mechanism_validation_cptac(candidate_genes, cptac_protein_path, cptac_rna_path, out_dir):
+    # NOTE: cptac_protein_path 文件由 01 脚本 rebuild_cptac_protein_gene_matrix() 重建
+    # 格式: Hugo_Symbol(列0) × 样本ID(列1..N)，基因行为索引
     results = []
     if not os.path.exists(cptac_protein_path) or not os.path.exists(cptac_rna_path):
+        logger.warning(f"[CPTAC] 文件不存在: protein={os.path.exists(cptac_protein_path)}, rna={os.path.exists(cptac_rna_path)}")
         return pd.DataFrame(results)
 
     try:
@@ -764,12 +1002,24 @@ def mechanism_validation_cptac(candidate_genes, cptac_protein_path, cptac_rna_pa
     except Exception:
         return pd.DataFrame(results)
 
+    # 诊断：检查蛋白矩阵是否有基因表达列
     prot_id_col = prot.columns[0]
     rna_id_col = rna.columns[0]
+    if prot.shape[1] <= 1:
+        logger.error(f"[CPTAC] 蛋白矩阵仅含 {prot.shape[1]} 列（仅ID列，无基因表达数据）。"
+                     f"文件可能损坏，需从原始数据重新生成: {cptac_protein_path}")
+        return pd.DataFrame(results)
     prot = prot.set_index(prot_id_col)
     rna = rna.set_index(rna_id_col)
     prot = prot.apply(pd.to_numeric, errors="coerce")
     rna = rna.apply(pd.to_numeric, errors="coerce")
+
+    # 诊断日志
+    logger.info(f"[CPTAC] 蛋白矩阵: {prot.shape[0]} genes x {prot.shape[1]} samples")
+    logger.info(f"[CPTAC] RNA矩阵: {rna.shape[0]} genes x {rna.shape[1]} samples")
+    prot_in_cand = [g for g in candidate_genes if g in prot.index]
+    rna_in_cand = [g for g in candidate_genes if g in rna.index]
+    logger.info(f"[CPTAC] 候选基因匹配: 蛋白={len(prot_in_cand)}/{len(candidate_genes)}, RNA={len(rna_in_cand)}/{len(candidate_genes)}")
 
     common_samples = prot.columns.intersection(rna.columns)
     if len(common_samples) < 5:
@@ -967,6 +1217,10 @@ def mechanism_cnv_methylation_concordance(candidate_genes, background_genes,
 
     CNV统计量 = |mean CNA| (候选基因整体偏向扩增或缺失)
     甲基化统计量 = mean |methylation deviation| (候选基因甲基化变异程度)
+
+    NOTE: cnv_path 和 methylation_path 文件均由 01 脚本 REBUILD 阶段重建:
+      - CNV: rebuild_cnv_gene_matrix() → Hugo_Symbol × patient_id, ~25K 基因
+      - 甲基化: rebuild_methylation_gene_matrix() → Hugo_Symbol × patient_id, TSS±2kb 映射
     """
     results = {}
 
@@ -979,6 +1233,12 @@ def mechanism_cnv_methylation_concordance(candidate_genes, background_genes,
                 cnv_mat = cnv.set_index("Hugo_Symbol").apply(pd.to_numeric, errors="coerce")
             else:
                 cnv_mat = cnv.set_index(id_col).apply(pd.to_numeric, errors="coerce").T
+            logger.info(f"[机制富集] CNV矩阵: {cnv_mat.shape[0]} genes x {cnv_mat.shape[1]} samples")
+            cnv_matched = [g for g in candidate_genes if g in cnv_mat.index]
+            logger.info(f"[机制富集] CNV候选基因匹配: {len(cnv_matched)}/{len(candidate_genes)}: {cnv_matched}")
+            if len(cnv_matched) == 0:
+                logger.warning(f"[机制富集] CNV矩阵仅含 {cnv_mat.shape[0]} 基因，"
+                               f"候选基因均未命中。需从GISTIC2.0重新生成gene-level矩阵")
             cand_vecs = {}
             for g in candidate_genes:
                 if g in cnv_mat.index:
@@ -1009,6 +1269,12 @@ def mechanism_cnv_methylation_concordance(candidate_genes, background_genes,
         try:
             meth = pd.read_csv(methylation_path, sep="\t", low_memory=False)
             id_col = meth.columns[0]
+            # 诊断：检查甲基化矩阵是否有基因数据列
+            if meth.shape[1] <= 1:
+                logger.error(f"[机制富集] 甲基化矩阵仅含 {meth.shape[1]} 列（仅ID列，无基因甲基化数据）。"
+                             f"需从HM450探针数据通过TSS proximity重新生成gene-level矩阵")
+            else:
+                logger.info(f"[机制富集] 甲基化矩阵: {meth.shape[0]} rows x {meth.shape[1]} cols")
             if id_col == "Hugo_Symbol":
                 meth_mat = meth.set_index("Hugo_Symbol").apply(pd.to_numeric, errors="coerce")
             else:
@@ -1279,10 +1545,14 @@ def main():
     go_bp_path = os.path.join(DATA_DIR, "msigdb", "c5.go.bp.v2024.1.Hs.symbols.gmt")
     causal_ref_path = os.path.join(DATA_DIR, "causal", "causal_priority_feature_table.tsv")
     split_path = os.path.join(DATA_DIR, "survival_models", "tcga_train_internal_validation_split.tsv")
+    # ── 以下三个 gene-level 矩阵由 01_data_preprocessing.py 的 REBUILD 阶段重建 ──
+    # CPTAC 蛋白矩阵: rebuild_cptac_protein_gene_matrix() 从肽段数据按 Hugo_Symbol 中位数聚合
     cptac_protein_path = os.path.join(DATA_DIR, "external", "cptac_coad_protein_gene_level_matrix.tsv")
     cptac_rna_path = os.path.join(DATA_DIR, "external", "cptac_coad_rna_gene_level_matrix.tsv")
     cptac_phospho_path = os.path.join(DATA_DIR, "external", "cptac_coad_phosphoprotein_gene_level_matrix.tsv")
+    # CNV 基因矩阵: rebuild_cnv_gene_matrix() 从 data_cna.txt (~25K基因) 转换
     cnv_path = os.path.join(DATA_DIR, "preprocessed", "tcga_coadread_cnv_gene_level_matrix.tsv")
+    # 甲基化基因矩阵: rebuild_methylation_gene_matrix() 从 HM450 探针 TSS±2kb 映射
     methylation_path = os.path.join(DATA_DIR, "preprocessed", "tcga_coadread_methylation_gene_level_matrix.tsv")
     multiomics_embedding_path = os.path.join(DATA_DIR, "multiomics", "tcga_multiomics_patient_embedding.tsv")
 
@@ -1342,24 +1612,97 @@ def main():
     univ.to_csv(os.path.join(out_dir, "tcga_univariable_cox_feature_screening.tsv"), sep="\t", index=False)
     logger.info(f"[02] Univariable Cox: {len(univ)} features tested")
 
-    # 防御性检查：如果univ为空或没有'ok'状态，回退到直接使用方差top基因
-    if univ.empty or "status" not in univ.columns or not (univ["status"] == "ok").any():
-        logger.warning("[02] WARNING: Univariable Cox 没有可用的候选特征，回退到方差top30基因...")
-        # 直接从方差排序结果中取top30
-        variance_sorted = variance_diag[variance_diag["selected_for_univariable_cox"]].copy()
-        variance_sorted = variance_sorted.sort_values("train_variance", ascending=False)
-        candidate_features = variance_sorted["feature"].head(30).tolist()
-        logger.info(f"[02] Fallback candidates (top variance): {len(candidate_features)}")
-    else:
-        univ_ok = univ[univ["status"] == "ok"].copy()
-        ok = univ_ok[univ_ok["fdr"].notna()]
-        fdr_sig = ok[ok["fdr"] <= 0.20].sort_values("fdr")
-        fdr_sig = fdr_sig[~fdr_sig["likely_pseudogene"]].head(30)
-        if fdr_sig.empty:
-            logger.info("[02] No FDR-significant genes, falling back to top-30 by p-value...")
-            fdr_sig = ok[~ok["likely_pseudogene"]].sort_values("p").head(30)
+    # === 筛选策略（基于文献证据） ===
+    # 标准流程: univariate Cox (p<0.2/top-200) → LASSO Cox → multivariate Cox
+    # 参考: BMC Cancer 2022 (Jardillier et al.) — 16个TCGA癌症benchmark,
+    #       top-200 univariate Cox p-value genes 为最优预筛选策略
+    univ_ok = univ[univ["status"] == "ok"].copy()
+    ok = univ_ok[univ_ok["fdr"].notna()]
+
+    # Step 2a: FDR 门控（保留作为参考）
+    fdr_sig = ok[ok["fdr"] <= 0.20].sort_values("fdr")
+    fdr_sig = fdr_sig[~fdr_sig["likely_pseudogene"]].head(30)
+
+    # Step 2b: LASSO Cox 回归筛选（文献标准方法）
+    lasso_result = {"selected_genes": [], "lasso_coefs": pd.DataFrame(), "lambda_opt": np.nan}
+    lasso_genes = []
+    # ── LASSO 候选池构建（文献依据: BMC Cancer 2022 Jardillier et al.）──
+    # 策略: 双轨制 — p<LASSO_P_THRESHOLD 放宽阈值 ∪ top-CAP 保底，确保候选池充分性
+    # 参考: "Pre-screening of the top 200 genes in terms of single variable
+    #        Cox model p-values is a practical way to reduce dimension"
+    mask_lasso = (ok["p"] < LASSO_P_THRESHOLD) & (~ok["likely_pseudogene"])
+    lasso_pool = ok[mask_lasso].sort_values("p")
+    # 双轨制: p<0.2 基因 ∪ p值排序 top-N，取并集后截断到上限
+    top_n_genes = ok.sort_values("p")[~ok["likely_pseudogene"]]["feature"].head(LASSO_CANDIDATE_CAP).tolist()
+    p_thresh_genes = lasso_pool["feature"].tolist()
+    lasso_input_genes = list(dict.fromkeys(p_thresh_genes + top_n_genes))[:LASSO_CANDIDATE_CAP]
+    # 保底: 若仍不足 LASSO_FALLBACK_MIN 个，使用 p 值排序 top-50
+    if len(lasso_input_genes) < LASSO_FALLBACK_MIN:
+        lasso_input_genes = ok.sort_values("p")[~ok["likely_pseudogene"]]["feature"].head(LASSO_FALLBACK_MIN).tolist()
+    if lasso_input_genes and len(train_ids) >= 30:
+        logger.info(f"[02] Step 2b: LASSO Cox regression on {len(lasso_input_genes)} candidate genes "
+                    f"(threshold=p<{LASSO_P_THRESHOLD}, cap={LASSO_CANDIDATE_CAP})...")
+        lasso_features = feature_df[lasso_input_genes].reindex(train_ids)
+        lasso_result = lasso_cox_screening(
+            train_clinical, lasso_features, time_col, event_col,
+            n_splits=10, max_features=50,
+            n_alphas=LASSO_N_ALPHAS, alpha_min_ratio=LASSO_ALPHA_MIN_RATIO,
+            random_seed=RANDOM_SEED,
+        )
+        lasso_genes = lasso_result["selected_genes"]
+        if not lasso_result["lasso_coefs"].empty:
+            lasso_result["lasso_coefs"].to_csv(
+                os.path.join(out_dir, "lasso_cox_coefficients.tsv"), sep="\t", index=False)
+        logger.info(f"[02] LASSO Cox: {len(lasso_genes)} genes selected")
+
+    # Step 2b-ext: Bootstrap 稳定性选择（可选，文献: Lancet子刊 bootstrap stability selection）
+    selection_method = ""
+    if BOOTSTRAP_ENABLED and lasso_genes and len(train_ids) >= 50:
+        logger.info(f"[02] Step 2b-ext: Bootstrap stability selection "
+                    f"(n={BOOTSTRAP_N}, threshold={BOOTSTRAP_THRESHOLD})...")
+        bs_result = bootstrap_stability_selection(
+            train_clinical, lasso_features, time_col, event_col,
+            n_bootstrap=BOOTSTRAP_N, selection_threshold=BOOTSTRAP_THRESHOLD,
+            n_alphas=LASSO_N_ALPHAS, alpha_min_ratio=LASSO_ALPHA_MIN_RATIO,
+            random_seed=RANDOM_SEED,
+        )
+        stable_genes = bs_result["selected_genes"]
+        bs_result["selection_frequency"].to_csv(
+            os.path.join(out_dir, "lasso_bootstrap_selection_frequency.tsv"),
+            sep="\t", index=False,
+        )
+        if stable_genes:
+            lasso_genes = stable_genes  # 用稳定性筛选结果替代原始LASSO结果
+            selection_method = "lasso_cox_bootstrap_stable"
+            logger.info(f"[02] Bootstrap stability: {len(stable_genes)} genes passed "
+                        f"(threshold={BOOTSTRAP_THRESHOLD})")
+        else:
+            logger.warning(f"[02] Bootstrap stability: no genes passed "
+                           f"threshold={BOOTSTRAP_THRESHOLD}, keeping original LASSO result")
+
+    # Step 2c: 合并候选基因（FDR ∪ LASSO，去重，优先LASSO）
+    extra = []
+    if lasso_genes:
+        # LASSO 优先，FDR补充到30个
+        candidate_features = lasso_genes[:30]
+        if len(candidate_features) < 30 and not fdr_sig.empty:
+            extra = [g for g in fdr_sig["feature"].tolist() if g not in candidate_features]
+            candidate_features.extend(extra[:30 - len(candidate_features)])
+        if not selection_method.startswith("lasso_cox_bootstrap"):
+            selection_method = "lasso_cox" + ("_fdr_supplement" if extra else "")
+        elif extra:
+            selection_method += "_fdr_supplement"
+    elif not fdr_sig.empty:
         candidate_features = fdr_sig["feature"].tolist()
-        logger.info(f"[02] FDR-passed candidates: {len(candidate_features)}")
+        selection_method = "fdr_0.20"
+    else:
+        # 最终回退：按 raw p-value top-30
+        logger.info("[02] No FDR/LASSO genes, falling back to top-30 by p-value...")
+        fallback_genes = ok[~ok["likely_pseudogene"]].sort_values("p").head(30)
+        candidate_features = fallback_genes["feature"].tolist()
+        selection_method = "raw_p_top30"
+
+    logger.info(f"[02] Final candidates: {len(candidate_features)} genes (method={selection_method})")
 
     if not candidate_features:
         logger.info("[02] No candidates passed screening. Saving empty outputs.")
@@ -1490,6 +1833,17 @@ def main():
         "multivariable_penalizer": 0.05,
         "tau_months": FIXED_TAU_MONTHS,
         "confounders": ["AGE", "SEX", "AJCC_PATHOLOGIC_TUMOR_STAGE", "SUBTYPE", "CANCER_TYPE_ACRONYM"],
+        "selection_method": selection_method,
+        "lasso_lambda_opt": lasso_result.get("lambda_opt", np.nan),
+        "lasso_n_selected": len(lasso_genes),
+        "lasso_prescreen_p_threshold": LASSO_P_THRESHOLD,
+        "lasso_candidate_cap": LASSO_CANDIDATE_CAP,
+        "lasso_n_input_genes": len(lasso_input_genes) if lasso_input_genes else 0,
+        "lasso_n_alphas": LASSO_N_ALPHAS,
+        "lasso_alpha_min_ratio": LASSO_ALPHA_MIN_RATIO,
+        "bootstrap_enabled": BOOTSTRAP_ENABLED,
+        "bootstrap_n": BOOTSTRAP_N,
+        "bootstrap_threshold": BOOTSTRAP_THRESHOLD,
         "n_variance_selected": len(selected),
         "n_univariable_tested": len(univ),
         "n_fdr_significant": len(fdr_sig),
