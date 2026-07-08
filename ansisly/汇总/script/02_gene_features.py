@@ -747,7 +747,7 @@ def lasso_cox_screening(clinical, features, time_col, event_col, n_splits=10,
         X_std = StandardScaler().fit_transform(X)
         # ── 构建精细化 alpha 路径（文献依据: glmnet lambda.min.ratio 机制）──
         # Step 1: 先用较少点快速拟合，获取 alpha_max（所有系数恰好为零的临界值）
-        coxnet_init = CoxnetSurvivalAnalysis(n_alphas=10, tol=1e-7, max_iter=100000)
+        coxnet_init = CoxnetSurvivalAnalysis(n_alphas=10, tol=1e-5, max_iter=100000)
         coxnet_init.fit(X_std, y_surv)
         alpha_max = float(coxnet_init.alphas_[0])  # 路径起始点（最大alpha）
         alpha_min = alpha_max * alpha_min_ratio     # 路径终止点
@@ -759,7 +759,7 @@ def lasso_cox_screening(clinical, features, time_col, event_col, n_splits=10,
         from sklearn.model_selection import GridSearchCV
         cv_folds = min(n_splits, len(common) // 5)
         gcv = GridSearchCV(
-            CoxnetSurvivalAnalysis(tol=1e-7, max_iter=100000),
+            CoxnetSurvivalAnalysis(tol=1e-5, max_iter=100000),
             param_grid={"alphas": [[a] for a in alpha_path]},
             cv=cv_folds,
             scoring=lambda est, Xv, yv: est.score(Xv, yv),
