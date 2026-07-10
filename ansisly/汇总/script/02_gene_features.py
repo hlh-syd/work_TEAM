@@ -43,6 +43,21 @@ logger = setup_logger("02_gene_features")
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="lifelines")
+warnings.filterwarnings(
+    "ignore",
+    message=".*sklearn.utils.parallel.delayed.*",
+    category=UserWarning,
+)
+
+# ── 因果新增模块配置（flat 常量导入）──
+from config_causal import (
+    CAUSAL_EGM_ENABLED, CAUSAL_EGM_LATENT_DIM, CAUSAL_EGM_EPOCHS,
+    CAUSAL_EGM_LR, CAUSAL_EGM_BATCH_SIZE, CAUSAL_EGM_FLOW_STEPS,
+    CAUSAL_EGM_FALLBACK, CAUSAL_EGM_MODE,
+    DEEPSURV_ENABLED, DEEPSURV_HIDDEN_DIMS, DEEPSURV_DROPOUT,
+    DEEPSURV_L2_REG, DEEPSURV_LR, DEEPSURV_EPOCHS, DEEPSURV_PATIENCE,
+    DEEPSURV_BATCH_SIZE, DEEPSURV_USE_CEGM_Z,
+)
 
 # --- Script-specific constants ---
 PSEUDOGENE_HINTS = ("P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9")
@@ -58,7 +73,26 @@ LASSO_N_ALPHAS = 300            # alpha路径点数（原100，增至300提高�
 LASSO_ALPHA_MIN_RATIO = 1e-4    # alpha下界/alpha_max比值（glmnet nobs>nvars默认值）
 BOOTSTRAP_ENABLED = True        # 是否启用bootstrap稳定性选择
 BOOTSTRAP_N = 200               # bootstrap重采样次数
-BOOTSTRAP_THRESHOLD = 0.8       # 选择频率阈值
+BOOTSTRAP_THRESHOLD = 0.6       # 选择频率阈值（Meinshausen-Bühlmann 2010 推荐）
+BOOTSTRAP_SUBSAMPLE_FRAC = 0.5  # 子采样比例（无放回，Shah-Samworth 2013）
+
+
+def _check_and_auto_disable():
+    """根据依赖可用性自动禁用因果新模块。"""
+    global CAUSAL_EGM_ENABLED, DEEPSURV_ENABLED
+    try:
+        import CausalEGM as causalegm  # noqa: F401
+    except ImportError:
+        logger.warning("[依赖] causalegm 未安装，自动禁用 CausalEGM")
+        CAUSAL_EGM_ENABLED = False
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        logger.warning("[依赖] torch 未安装，自动禁用 DeepSurv")
+        DEEPSURV_ENABLED = False
+
+
+_check_and_auto_disable()
 
 
 def is_likely_pseudogene(symbol):
@@ -743,6 +777,7 @@ def lasso_cox_screening(clinical, features, time_col, event_col, n_splits=10,
     try:
         from sksurv.linear_model import CoxnetSurvivalAnalysis
         from sksurv.util import Surv
+        from sklearn.model_selection import KFold
         y_surv = Surv.from_arrays(event=y_event.astype(bool), time=y_time)
         X_std = StandardScaler().fit_transform(X)
         # ── 构建精细化 alpha 路径（文献依据: glmnet lambda.min.ratio 机制）──
@@ -755,25 +790,45 @@ def lasso_cox_screening(clinical, features, time_col, event_col, n_splits=10,
         alpha_path = np.logspace(np.log10(alpha_max), np.log10(alpha_min), n_alphas)
         logger.info(f"[LASSO-Cox] Alpha path: {n_alphas} points, "
                     f"range=[{alpha_min:.6f}, {alpha_max:.4f}], ratio={alpha_min_ratio}")
-        # Step 3: GridSearchCV 交叉验证选最优 alpha
-        from sklearn.model_selection import GridSearchCV
+        # Step 3: 手动K折CV + 全路径拟合（高效：每次fit计算整个alpha路径）
         cv_folds = min(n_splits, len(common) // 5)
-        gcv = GridSearchCV(
-            CoxnetSurvivalAnalysis(tol=1e-5, max_iter=100000),
-            param_grid={"alphas": [[a] for a in alpha_path]},
-            cv=cv_folds,
-            scoring=lambda est, Xv, yv: est.score(Xv, yv),
-            refit=True,
-        ).fit(X_std, y_surv)
-        coxnet = gcv.best_estimator_
-        coefs = coxnet.coef_
-        best_alpha = gcv.best_params_["alphas"][0]
-        # 取最优lambda下非零系数基因
-        nonzero_mask = np.abs(coefs).flatten() > 1e-8
+        kf = KFold(n_splits=cv_folds, shuffle=True, random_state=random_seed)
+        cv_scores = np.zeros(len(alpha_path))
+        for fold_idx, (train_idx, val_idx) in enumerate(kf.split(X_std)):
+            X_tr, X_val = X_std[train_idx], X_std[val_idx]
+            y_tr = y_surv[train_idx]
+            # 一次 fit 计算整个正则化路径（warm-start 高效）
+            coxnet_cv = CoxnetSurvivalAnalysis(alphas=alpha_path, tol=1e-5, max_iter=100000)
+            coxnet_cv.fit(X_tr, y_tr)
+            # 逐 alpha 评分（利用 coxnet_cv 路径上的系数）
+            for j, alpha_val in enumerate(coxnet_cv.alphas_):
+                coef_j = coxnet_cv.coef_[:, j] if coxnet_cv.coef_.ndim > 1 else coxnet_cv.coef_
+                risk_val = X_val @ coef_j
+                if np.std(risk_val) > 1e-10:
+                    from lifelines.utils import concordance_index
+                    time_val = y_time[val_idx]
+                    event_val = y_event[val_idx].astype(bool)
+                    try:
+                        c = concordance_index(time_val, -risk_val, event_val)
+                        cv_scores[j] += c
+                    except Exception:
+                        pass
+            if (fold_idx + 1) % 3 == 0:
+                logger.info(f"[LASSO-Cox] CV fold {fold_idx+1}/{cv_folds} done")
+        cv_scores /= cv_folds
+        best_idx = int(np.argmax(cv_scores))
+        best_alpha = float(alpha_path[best_idx])
+        logger.info(f"[LASSO-Cox] Best alpha={best_alpha:.6f}, CV C-index={cv_scores[best_idx]:.4f}")
+        # Step 4: 用最优 alpha 在全数据上重新拟合
+        coxnet = CoxnetSurvivalAnalysis(alphas=[best_alpha], tol=1e-5, max_iter=100000)
+        coxnet.fit(X_std, y_surv)
+        coefs = coxnet.coef_.flatten()
+        # 取非零系数基因
+        nonzero_mask = np.abs(coefs) > 1e-8
         selected = X.columns[nonzero_mask].tolist()[:max_features]
         coef_df = pd.DataFrame({
             "feature": X.columns,
-            "lasso_coef": coefs.flatten(),
+            "lasso_coef": coefs,
         }).sort_values("lasso_coef", key=abs, ascending=False)
         coef_df = coef_df[coef_df["lasso_coef"].abs() > 1e-8].head(max_features)
         logger.info(f"[LASSO-Cox] scikit-survival: {len(selected)} genes selected, lambda={best_alpha:.6f}")
@@ -855,44 +910,58 @@ def bootstrap_stability_selection(clinical, features, time_col, event_col,
 
     rng = np.random.RandomState(random_seed)
     common = clinical.index.intersection(features.index)
+    if len(common) == 0 and "PATIENT_ID" in clinical.columns:
+        # 索引不匹配时尝试用 PATIENT_ID 对齐
+        clinical = clinical.set_index("PATIENT_ID")
+        common = clinical.index.astype(str).intersection(features.index.astype(str))
+        clinical.index = clinical.index.astype(str)
     y_surv = np.array([(bool(clinical.loc[s, event_col]),
                         float(clinical.loc[s, time_col])) for s in common],
                       dtype=[("event", "?"), ("time", "<f8")])
     X = features.loc[common].copy()
     gene_names = X.columns.tolist()
     n_samples = len(common)
-    sample_size = int(n_samples * 0.8)  # 每次抽80%
+    sample_size = int(n_samples * BOOTSTRAP_SUBSAMPLE_FRAC)  # 子采样50%（无放回）
 
     selection_counts = {g: 0 for g in gene_names}
     n_success = 0
 
     for i in range(n_bootstrap):
-        # 有放回抽样
-        boot_idx = rng.choice(n_samples, size=sample_size, replace=True)
+        # 无放回子采样（Meinshausen-Bühlmann 2010, Shah-Samworth 2013）
+        boot_idx = rng.choice(n_samples, size=sample_size, replace=False)
         boot_common = common[boot_idx]
         y_boot = y_surv[boot_idx]
         X_boot = X.iloc[boot_idx]
 
-        try:
-            X_std = StandardScaler().fit_transform(X_boot)
-            # 快速拟合获取 alpha_max
-            coxnet_init = CoxnetSurvivalAnalysis(n_alphas=5, tol=1e-5, max_iter=50000)
-            coxnet_init.fit(X_std, y_boot)
-            a_max = float(coxnet_init.alphas_[0])
-            a_min = a_max * alpha_min_ratio
-            # 用较少点加速（bootstrap不需要极致精度）
-            a_path = np.logspace(np.log10(a_max), np.log10(a_min), min(n_alphas, 100))
-            coxnet = CoxnetSurvivalAnalysis(alphas=a_path, tol=1e-5, max_iter=50000)
-            coxnet.fit(X_std, y_boot)
-            coefs = coxnet.coef_.flatten()
-            # 记录非零系数基因
-            for j, g in enumerate(gene_names):
-                if abs(coefs[j]) > 1e-8:
-                    selection_counts[g] += 1
-            n_success += 1
-        except Exception:
-            # 单次bootstrap失败不影响整体
-            continue
+        with warnings.catch_warnings():
+            from sklearn.exceptions import ConvergenceWarning
+            warnings.filterwarnings("ignore", category=ConvergenceWarning)
+            warnings.filterwarnings("ignore", message=".*Optimization terminated early.*")
+
+            try:
+                X_std = StandardScaler().fit_transform(X_boot)
+                # 快速拟合获取 alpha_max
+                coxnet_init = CoxnetSurvivalAnalysis(n_alphas=5, tol=1e-5, max_iter=50000)
+                coxnet_init.fit(X_std, y_boot)
+                a_max = float(coxnet_init.alphas_[0])
+                a_min = a_max * alpha_min_ratio
+                # 用较少 alpha 点 + 更保守的范围加速 bootstrap 收敛
+                bs_alpha_min_ratio = max(alpha_min_ratio, 1e-2)
+                a_min = a_max * bs_alpha_min_ratio
+                a_path = np.logspace(np.log10(a_max), np.log10(a_min), min(n_alphas, 50))
+                coxnet = CoxnetSurvivalAnalysis(alphas=a_path, tol=1e-5, max_iter=50000)
+                coxnet.fit(X_std, y_boot)
+                coefs = coxnet.coef_.flatten()
+                # 记录非零系数基因
+                for j, g in enumerate(gene_names):
+                    if abs(coefs[j]) > 1e-8:
+                        selection_counts[g] += 1
+                n_success += 1
+            except Exception as exc:
+                # 单次bootstrap失败不影响整体，记录首次错误用于诊断
+                if n_success == 0 and i == 0:
+                    logger.warning(f"[Bootstrap] 首次迭代失败（诊断）: {type(exc).__name__}: {exc}")
+                continue
 
         # 每50次输出进度
         if (i + 1) % 50 == 0:
@@ -1480,9 +1549,9 @@ def build_evidence_matrix(causal_table, univar_table, multivar_table, cptac_tabl
         indicator_cols = [c for c in ["sign_agreement"] if c in evidence.columns]
         plot_evidence = evidence.head(30)
         if indicator_cols and not plot_evidence.empty:
-            heat = plot_evidence.set_index("feature")[indicator_cols].replace(
-                {True: 1.0, False: 0.0, "True": 1.0, "False": 0.0}
-            )
+            heat = plot_evidence.set_index("feature")[indicator_cols].copy()
+            for col in heat.columns:
+                heat[col] = heat[col].map({True: 1.0, False: 0.0, "True": 1.0, "False": 0.0}).fillna(0.5)
             heat = heat.apply(pd.to_numeric, errors="coerce").fillna(0.5).astype(float)
 
             num_cols_in_evidence = []
@@ -1639,6 +1708,31 @@ def main():
     # 保底: 若仍不足 LASSO_FALLBACK_MIN 个，使用 p 值排序 top-50
     if len(lasso_input_genes) < LASSO_FALLBACK_MIN:
         lasso_input_genes = ok.sort_values("p")[~ok["likely_pseudogene"]]["feature"].head(LASSO_FALLBACK_MIN).tolist()
+    # ═══ 新增: CausalEGM 降维（LASSO 之前）═══
+    cegm_Z = None  # 标记是否成功获取潜在表征
+    if CAUSAL_EGM_ENABLED and lasso_input_genes and len(train_ids) >= 30:
+        try:
+            from causal_egm_adapter import CausalEGMAdapter, _build_treatment_proxy
+            cegm = CausalEGMAdapter(
+                latent_dim=CAUSAL_EGM_LATENT_DIM, epochs=CAUSAL_EGM_EPOCHS,
+                lr=CAUSAL_EGM_LR, batch_size=CAUSAL_EGM_BATCH_SIZE,
+                flow_steps=CAUSAL_EGM_FLOW_STEPS, mode=CAUSAL_EGM_MODE,
+                random_state=RANDOM_SEED,
+            )
+            cegm_features = feature_df[lasso_input_genes].reindex(train_ids).fillna(0)
+            treatment_proxy = _build_treatment_proxy(train_clinical, cegm_features.index)
+            outcome_time = pd.to_numeric(
+                train_clinical.set_index("PATIENT_ID")
+                .reindex(train_ids)[time_col], errors="coerce"
+            )
+            cegm_Z = cegm.fit_transform(cegm_features, treatment_proxy, outcome_time)
+            logger.info(f"[CausalEGM] {cegm_Z.shape[1]}维潜在表征提取成功 "
+                        f"({cegm_Z.shape[0]} samples)")
+            cegm_Z.to_csv(os.path.join(out_dir, "causalegm_latent_Z.tsv"), sep="\t")
+        except Exception as exc:
+            logger.warning(f"[CausalEGM] 训练失败，回退到原始特征: {exc}")
+            cegm_Z = None
+
     if lasso_input_genes and len(train_ids) >= 30:
         logger.info(f"[02] Step 2b: LASSO Cox regression on {len(lasso_input_genes)} candidate genes "
                     f"(threshold=p<{LASSO_P_THRESHOLD}, cap={LASSO_CANDIDATE_CAP})...")
@@ -1660,8 +1754,10 @@ def main():
     if BOOTSTRAP_ENABLED and lasso_genes and len(train_ids) >= 50:
         logger.info(f"[02] Step 2b-ext: Bootstrap stability selection "
                     f"(n={BOOTSTRAP_N}, threshold={BOOTSTRAP_THRESHOLD})...")
+        # 仅对 LASSO 选出的基因做稳定性选择（而非全部 200 个候选基因）
+        bootstrap_features = feature_df[lasso_genes].reindex(train_ids) if lasso_genes else lasso_features
         bs_result = bootstrap_stability_selection(
-            train_clinical, lasso_features, time_col, event_col,
+            train_clinical, bootstrap_features, time_col, event_col,
             n_bootstrap=BOOTSTRAP_N, selection_threshold=BOOTSTRAP_THRESHOLD,
             n_alphas=LASSO_N_ALPHAS, alpha_min_ratio=LASSO_ALPHA_MIN_RATIO,
             random_seed=RANDOM_SEED,
@@ -1703,6 +1799,39 @@ def main():
         selection_method = "raw_p_top30"
 
     logger.info(f"[02] Final candidates: {len(candidate_features)} genes (method={selection_method})")
+    # ═══ 新增: DeepSurv 交叉验证 ═══
+    deepsurv_results = {"c_index": np.nan, "enabled": DEEPSURV_ENABLED}
+    if DEEPSURV_ENABLED and candidate_features and len(train_ids) >= 50:
+        try:
+            from deepsurv_head import DeepSurvHead
+            if cegm_Z is not None and DEEPSURV_USE_CEGM_Z:
+                ds_features = cegm_Z
+                logger.info("[DeepSurv] 使用 CausalEGM 潜在表征作为输入")
+            else:
+                ds_features = feature_df[candidate_features].reindex(train_ids).fillna(0)
+                logger.info("[DeepSurv] 使用候选基因表达矩阵作为输入")
+
+            ds_clinical = train_clinical.set_index("PATIENT_ID").reindex(ds_features.index)
+            ds_time = pd.to_numeric(ds_clinical[time_col], errors="coerce")
+            ds_event = ds_clinical[event_col].astype(int)
+            valid = ds_time.notna() & (ds_time > 0)
+
+            ds = DeepSurvHead(
+                hidden_dims=DEEPSURV_HIDDEN_DIMS, dropout=DEEPSURV_DROPOUT,
+                l2_reg=DEEPSURV_L2_REG, lr=DEEPSURV_LR, epochs=DEEPSURV_EPOCHS,
+                patience=DEEPSURV_PATIENCE, batch_size=DEEPSURV_BATCH_SIZE,
+                random_state=RANDOM_SEED,
+            )
+            ds.fit(ds_features[valid], ds_time[valid], ds_event[valid])
+            c_index = ds.score(ds_features[valid], ds_time[valid], ds_event[valid])
+            deepsurv_results["c_index"] = c_index
+            logger.info(f"[DeepSurv] 训练完成, C-index={c_index:.3f}")
+            ds_importance = ds.get_feature_importance(ds_features[valid], ds_time[valid], ds_event[valid])
+            ds_importance.to_csv(os.path.join(out_dir, "deepsurv_feature_importance.tsv"),
+                                 sep="\t", index=False)
+        except Exception as exc:
+            logger.warning(f"[DeepSurv] 训练失败（不影响主流程）: {exc}")
+            deepsurv_results["c_index"] = np.nan
 
     if not candidate_features:
         logger.info("[02] No candidates passed screening. Saving empty outputs.")
@@ -1853,6 +1982,11 @@ def main():
         "n_cohort_mechanism_tests": len(cohort_mechanism_df) if cohort_mechanism_df is not None else 0,
         "n_mechanism_significant": int(cohort_mechanism_df["significant"].sum()) if cohort_mechanism_df is not None and "significant" in cohort_mechanism_df.columns else 0,
         "candidate_genes": candidate_features,
+        "causal_egm_enabled": CAUSAL_EGM_ENABLED,
+        "causal_egm_latent_dim": CAUSAL_EGM_LATENT_DIM,
+        "causal_egm_z_extracted": cegm_Z is not None,
+        "deepsurv_enabled": DEEPSURV_ENABLED,
+        "deepsurv_c_index": deepsurv_results.get("c_index", np.nan),
     }
     with open(os.path.join(out_dir, "gene_feature_config.json"), "w") as f:
         json.dump(config, f, indent=2)
