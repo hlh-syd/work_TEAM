@@ -69,6 +69,7 @@ _AJCC_STAGE_MAP = STAGE_MAP_NUMERIC
 LASSO_P_THRESHOLD = 0.20        # 预筛选p值阈值（原0.05，BMC Cancer 2022推荐放宽）
 LASSO_CANDIDATE_CAP = 200       # 候选基因上限（BMC Cancer 2022: top-200 is practical）
 LASSO_FALLBACK_MIN = 50         # 保底最少候选基因数
+FDR_SUPPLEMENT_MAX = 10         # FDR补充基因上限（Meinshausen 2010: 稳定性选择后仅做少量FDR补充）
 LASSO_N_ALPHAS = 300            # alpha路径点数（原100，增至300提高精度）
 LASSO_ALPHA_MIN_RATIO = 1e-4    # alpha下界/alpha_max比值（glmnet nobs>nvars默认值）
 BOOTSTRAP_ENABLED = True        # 是否启用bootstrap稳定性选择
@@ -1777,13 +1778,16 @@ def main():
                            f"threshold={BOOTSTRAP_THRESHOLD}, keeping original LASSO result")
 
     # Step 2c: 合并候选基因（FDR ∪ LASSO，去重，优先LASSO）
+    # 文献依据: Meinshausen & Bühlmann (2010) 稳定性选择阈值已控制假发现,
+    #          不应再做人为截断, 保留全部通过稳定性阈值的基因
     extra = []
     if lasso_genes:
-        # LASSO 优先，FDR补充到30个
-        candidate_features = lasso_genes[:30]
-        if len(candidate_features) < 30 and not fdr_sig.empty:
-            extra = [g for g in fdr_sig["feature"].tolist() if g not in candidate_features]
-            candidate_features.extend(extra[:30 - len(candidate_features)])
+        # LASSO/Bootstrap 稳定基因全部保留（不做 top-N 截断）
+        candidate_features = list(lasso_genes)
+        if not fdr_sig.empty:
+            extra = [g for g in fdr_sig["feature"].tolist()
+                     if g not in candidate_features][:FDR_SUPPLEMENT_MAX]
+            candidate_features.extend(extra)
         if not selection_method.startswith("lasso_cox_bootstrap"):
             selection_method = "lasso_cox" + ("_fdr_supplement" if extra else "")
         elif extra:
@@ -1792,11 +1796,11 @@ def main():
         candidate_features = fdr_sig["feature"].tolist()
         selection_method = "fdr_0.20"
     else:
-        # 最终回退：按 raw p-value top-30
-        logger.info("[02] No FDR/LASSO genes, falling back to top-30 by p-value...")
-        fallback_genes = ok[~ok["likely_pseudogene"]].sort_values("p").head(30)
+        # 最终回退：按 raw p-value top-50
+        logger.info("[02] No FDR/LASSO genes, falling back to top-50 by p-value...")
+        fallback_genes = ok[~ok["likely_pseudogene"]].sort_values("p").head(50)
         candidate_features = fallback_genes["feature"].tolist()
-        selection_method = "raw_p_top30"
+        selection_method = "raw_p_top50"
 
     logger.info(f"[02] Final candidates: {len(candidate_features)} genes (method={selection_method})")
     # ═══ 新增: DeepSurv 交叉验证 ═══
@@ -1956,7 +1960,7 @@ def main():
         "timestamp": timestamp,
         "top_variance_genes": 2000,
         "fdr_threshold": 0.20,
-        "top_priority": 30,
+        "top_priority": len(candidate_features),  # 动态: 保留全部稳定基因（不做人为截断）
         "min_events_per_feature": 5,
         "min_unique_values_per_feature": 3,
         "multivariable_penalizer": 0.05,
@@ -1967,6 +1971,7 @@ def main():
         "lasso_n_selected": len(lasso_genes),
         "lasso_prescreen_p_threshold": LASSO_P_THRESHOLD,
         "lasso_candidate_cap": LASSO_CANDIDATE_CAP,
+        "fdr_supplement_max": FDR_SUPPLEMENT_MAX,
         "lasso_n_input_genes": len(lasso_input_genes) if lasso_input_genes else 0,
         "lasso_n_alphas": LASSO_N_ALPHAS,
         "lasso_alpha_min_ratio": LASSO_ALPHA_MIN_RATIO,
