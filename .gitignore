@@ -55,6 +55,16 @@ __pycache__/
 !ansisly/汇总/script/shared_utils.py
 !ansisly/汇总/script/pipeline_config.json
 
+# 因果模型脚本（031-034）及辅助模块
+!ansisly/汇总/script/031_Casual_model.py
+!ansisly/汇总/script/032_CausalModel.py
+!ansisly/汇总/script/033_CausalModel.py
+!ansisly/汇总/script/034_CausalModel.py
+!ansisly/汇总/script/causal_egm_adapter.py
+!ansisly/汇总/script/config_causal.py
+!ansisly/汇总/script/deepsurv_head.py
+!ansisly/汇总/script/gain_imputer.py
+
 # =============================================================================
 # 新增文件时：在 Layer 4 添加 !<具体路径> 即可
 # =============================================================================
