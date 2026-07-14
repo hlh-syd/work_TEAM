@@ -60,6 +60,7 @@ __pycache__/
 !ansisly/汇总/script/032_CausalModel.py
 !ansisly/汇总/script/033_CausalModel.py
 !ansisly/汇总/script/034_CausalModel.py
+!ansisly/汇总/script/035_CasualModel.py
 !ansisly/汇总/script/causal_egm_adapter.py
 !ansisly/汇总/script/config_causal.py
 !ansisly/汇总/script/deepsurv_head.py
