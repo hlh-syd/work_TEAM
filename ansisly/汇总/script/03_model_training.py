@@ -78,6 +78,14 @@ from shared_utils import (
     normalize_patient_id, detect_event_time_columns, coerce_event,
     TieredImputer, load_pipeline_config,
 )
+
+try:
+    from vae_augmentor import VAEAugmentor, train_only_vae_augmentation
+    HAS_VAE_AUGMENTOR = True
+except ImportError:
+    VAEAugmentor = None
+    train_only_vae_augmentation = None
+    HAS_VAE_AUGMENTOR = False
 logger = setup_logger("03_model_training")
 
 
@@ -87,6 +95,122 @@ SURVIVAL_GAN_CONDITION_COLUMNS = [
     "death_by_36m", "event", "log1p_time_months",
     "pseudo_risk_36m_clipped", "ipcw_weight_36m",
 ]
+
+# ── MSigDB Hallmark 通路基因集（CRC 预后相关通路精简版）────────────────
+# 从 MSigDB H (hallmark) 50 个通路中选取与 CRC 预后最相关的 20 个通路
+# 每个通路列出代表性的基因名（以 300 个输入基因为基础进行匹配）
+HALLMARK_CRC_PATHWAYS = {
+    "WNT_BETA_CATENIN": ["APC", "CTNNB1", "TCF7L2", "AXIN2", "MYC", "CCND1", "SOX9",
+                          "LEF1", "FZD5", "WNT5A", "DKK1", "LGR5"],
+    "EPITHELIAL_MESENCHYMAL": ["CDH1", "CDH2", "VIM", "SNAI1", "SNAI2", "ZEB1", "ZEB2",
+                                 "TWIST1", "FN1", "COL1A1", "MMP2", "MMP9"],
+    "TGF_BETA": ["TGFB1", "SMAD2", "SMAD3", "SMAD4", "BMP2", "BMP4", "FSTL1",
+                  "ACVR1", "TGFBR2", "ENG", "THBS1"],
+    "P53_PATHWAY": ["TP53", "MDM2", "CDKN1A", "BAX", "BBC3", "GADD45A", "RRM2B",
+                     "SESN1", "SERPINE1", "CCNG1"],
+    "APOPTOSIS": ["BCL2", "BCL2L1", "CASP3", "CASP8", "CASP9", "FAS", "FADD",
+                   "BIRC5", "XIAP", "CYCS"],
+    "ANGIOGENESIS": ["VEGFA", "VEGFR2", "FLT1", "KDR", "FGF2", "PDGFB", "ANGPT1",
+                      "ANGPT2", "TIE1", "HIF1A"],
+    "INFLAMMATORY_RESPONSE": ["IL1B", "IL6", "TNF", "CXCL8", "CCL2", "CXCL10",
+                               "NFKB1", "RELA", "STAT3", "IRF1"],
+    "INTERFERON_GAMMA": ["IFNG", "STAT1", "IRF1", "GBP1", "CXCL9", "CXCL10",
+                          "IDO1", "HLA-B", "TAP1"],
+    "TNFA_SIGNALING_VIA_NFKB": ["TNF", "NFKB1", "RELA", "NFKBIA", "TRAF1", "BIRC3",
+                                  "ICAM1", "JUNB", "FOS", "EGR1"],
+    "KRAS_SIGNALING_UP": ["KRAS", "NRAS", "BRAF", "MAP2K1", "EGF", "FGF", "EGFR",
+                            "MET", "ERBB2", "ERBB3"],
+    "HYPOXIA": ["HIF1A", "VEGFA", "LDHA", "PGK1", "SLC2A1", "HK1", "HK2",
+                 "BNIP3", "BNIP3L", "NDRG1"],
+    "GLYCOLYSIS": ["HK2", "PFKL", "PFKP", "ALDOA", "GAPDH", "PGK1", "ENO1",
+                    "PKM", "LDHA", "SLC2A1"],
+    "MTORC1_SIGNALING": ["MTOR", "RPTOR", "AKT1", "AKT2", "EIF4E", "EIF4EBP1",
+                           "RPS6KB1", "SREBF1", "HIF1A"],
+    "PI3K_AKT_MTOR": ["PIK3CA", "PIK3CB", "AKT1", "PTEN", "MTOR", "RHEB",
+                        "TSC1", "TSC2", "RICTOR"],
+    "DNA_REPAIR": ["MSH2", "MSH6", "MLH1", "PMS2", "BRCA1", "BRCA2", "ATM",
+                    "ATR", "PARP1", "RAD51"],
+    "CELL_CYCLE": ["CCNB1", "CCND1", "CCNE1", "CDK1", "CDK2", "CDK4", "CDK6",
+                    "RB1", "E2F1", "PCNA"],
+    "NOTCH_SIGNALING": ["NOTCH1", "NOTCH2", "JAG1", "DLL1", "DLL4", "HES1",
+                          "HEY1", "RBPJ"],
+    "MYC_TARGETS_V1": ["MYC", "NCL", "NPM1", "NOP56", "DDX21", "PA2G4", "PPAN",
+                         "RPL3", "RPL10", "RPS2"],
+    "OXIDATIVE_PHOSPHORYLATION": ["NDUFA9", "NDUFB8", "SDHA", "SDHB", "UQCRC1",
+                                    "COX5A", "ATP5A1", "ATP5B"],
+    "REACTIVE_OXYGEN_SPECIES": ["SOD1", "SOD2", "GPX1", "GPX4", "CAT", "PRDX1",
+                                  "TXN", "TXNIP", "NFE2L2"],
+}
+
+
+def build_pathway_features(
+    gene_expr: pd.DataFrame,
+    patients: list,
+    pathways: dict = None,
+    min_genes_match: int = 3,
+    min_pathways_enable: int = 5,
+) -> pd.DataFrame:
+    """从基因表达数据中提取通路均值特征。
+
+    对每个通路，取该通路内在 gene_expr 中存在的基因的表达均值作为通路特征。
+    仅在训练集上 fit StandardScaler 后 transform 全量样本。
+
+    Args:
+        gene_expr: 基因表达 DataFrame (n_samples, n_genes)。
+        patients: 患者 ID 列表（用于对齐索引）。
+        pathways: 通路字典 {通路名: [基因列表]}，默认使用 HALLMARK_CRC_PATHWAYS。
+        min_genes_match: 每通路至少匹配的基因数，低于此数则跳过该通路。
+        min_pathways_enable: 最少匹配通路数，低于此数则跳过通路特征。
+
+    Returns:
+        (pathway_features_df, active_pathways, active_gene_counts)
+        - pathway_features_df: pd.DataFrame (n_samples, n_pathways)，
+          若匹配通路不足则返回空 DataFrame。
+        - active_pathways: list[str] 成功匹配的通路名。
+        - active_gene_counts: dict 每通路匹配的基因数。
+    """
+    if pathways is None:
+        pathways = HALLMARK_CRC_PATHWAYS
+
+    expr_genes = set(gene_expr.columns)
+    pathway_cols = []
+    pathway_names = []
+    active_gene_counts = {}
+
+    for pname, plist in pathways.items():
+        matched = [g for g in plist if g in expr_genes]
+        if len(matched) < min_genes_match:
+            continue
+        pathway_names.append(pname)
+        pathway_cols.append(matched)
+        active_gene_counts[pname] = len(matched)
+
+    if len(pathway_names) < min_pathways_enable:
+        logger.warning(
+            f"[03] 通路特征: 仅匹配 {len(pathway_names)} 个通路 "
+            f"(最小需要 {min_pathways_enable})，跳过"
+        )
+        return pd.DataFrame(index=patients), [], {}
+
+    # 截断患者到 expression 中实际存在的
+    expr_indexed = gene_expr.reindex(patients)
+
+    # 逐通路计算均值
+    pw_matrix = np.zeros((len(patients), len(pathway_names)), dtype=np.float32)
+    for i, cols in enumerate(pathway_cols):
+        pw_matrix[:, i] = np.nanmean(expr_indexed[cols].values, axis=1)
+
+    pw_df = pd.DataFrame(
+        pw_matrix,
+        index=patients,
+        columns=[f"PW_{pname[:20]}" for pname in pathway_names],
+    )
+
+    logger.info(
+        f"[03] 通路特征提取: {len(pathway_names)} 个通路, "
+        f"平均基因数={np.mean(list(active_gene_counts.values())):.1f}"
+    )
+    return pw_df, pathway_names, active_gene_counts
 
 GAN_AUG_RATIO_CANDIDATES = (0.25, 0.5, 1.0, 2.0)
 GAN_SAMPLING_STRATEGIES = ("balanced_event", "risk_stratified", "event_only", "overall")
@@ -303,6 +427,100 @@ def build_survival_gan_conditions(endpoint, index):
     cond["pseudo_risk_36m_clipped"] = pseudo.replace([np.inf, -np.inf], np.nan).fillna(cond["death_by_36m"]).clip(0.0, 1.0)
     cond["ipcw_weight_36m"] = weight.replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(lower=EPS)
     return cond[SURVIVAL_GAN_CONDITION_COLUMNS].astype(float)
+
+
+def select_features_lasso(
+    X_train_features: pd.DataFrame,
+    train_time: np.ndarray,
+    train_event: np.ndarray,
+    n_features_target: int = 50,
+    seed: int = RANDOM_SEED,
+) -> list:
+    """LASSO-Cox 特征筛选（仅在训练集上 fit，避免数据泄漏）。
+
+    使用 CoxnetSurvivalAnalysis 的 L1 正则化筛选与生存相关的特征，
+    再按系数绝对值排序取 top-K。
+
+    Args:
+        X_train_features: 训练集特征矩阵 (n_train, n_features)。
+        train_time: 生存时间数组 (n_train,)。
+        train_event: 事件指示器数组 (n_train,)，1=事件, 0=删失。
+        n_features_target: 目标特征数，默认 50。
+        seed: 随机种子。
+
+    Returns:
+        选中的特征列名列表。若 LASSO 失败则返回全部列名。
+    """
+    if CoxnetSurvivalAnalysis is None or Surv is None:
+        logger.warning("[03] LASSO 特征筛选: sksurv 不可用，跳过")
+        return list(X_train_features.columns)
+
+    if len(train_time) < 10 or train_event.sum() < 5:
+        logger.warning("[03] LASSO 特征筛选: 样本或事件数不足，跳过")
+        return list(X_train_features.columns)
+
+    try:
+        # 标准化（仅在训练集上 fit）
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(
+            X_train_features.replace([np.inf, -np.inf], np.nan).fillna(X_train_features.median(numeric_only=True))
+        )
+
+        # 构建 survival array
+        y_surv = Surv.from_arrays(
+            train_event.astype(bool),
+            train_time.astype(float),
+        )
+
+        # LASSO-Cox: l1_ratio=1.0 为纯 LASSO
+        coxnet_screen = CoxnetSurvivalAnalysis(
+            l1_ratio=1.0,
+            n_alphas=50,
+            fit_baseline_model=True,
+            max_iter=10000,
+        )
+        coxnet_screen.fit(X_scaled, y_surv)
+
+        # 取最优 alpha
+        if hasattr(coxnet_screen, 'deviance_'):
+            best_alpha = coxnet_screen.alphas_[np.argmin(coxnet_screen.deviance_)]
+        else:
+            # sksurv 新版本可能用不同属性名
+            best_alpha = coxnet_screen.alphas_[-1]  # 使用最后一个 alpha（最强正则化）
+        coxnet_final = CoxnetSurvivalAnalysis(
+            l1_ratio=1.0,
+            alphas=[best_alpha],
+            fit_baseline_model=True,
+            max_iter=10000,
+        )
+        coxnet_final.fit(X_scaled, y_surv)
+
+        coefs = np.abs(coxnet_final.coef_.ravel())
+        feature_names = list(X_train_features.columns)
+
+        # 非零系数特征
+        nonzero_mask = coefs > 0
+        nonzero_features = [feature_names[i] for i in range(len(feature_names)) if nonzero_mask[i]]
+        nonzero_coefs = coefs[nonzero_mask]
+
+        # 按系数绝对值排序，取 top-K
+        if len(nonzero_features) > n_features_target:
+            sorted_idx = np.argsort(nonzero_coefs)[::-1]
+            nonzero_features = [nonzero_features[i] for i in sorted_idx[:n_features_target]]
+
+        if not nonzero_features:
+            logger.warning("[03] LASSO 特征筛选: 无非零系数特征，回退到全部特征")
+            return feature_names
+
+        logger.info(
+            f"[03] LASSO 特征筛选: {len(feature_names)} → {len(nonzero_features)} 特征 "
+            f"(target={n_features_target}, alpha={best_alpha:.6f})"
+        )
+        return nonzero_features
+
+    except Exception as e:
+        logger.warning(f"[03] LASSO 特征筛选失败: {e}，回退到全部特征")
+        return list(X_train_features.columns)
 
 
 def fit_clinical_transformer(clinical, split, feature_cols):
@@ -773,11 +991,7 @@ def fit_xgb_cox(x, split, seed=RANDOM_SEED):
         n_jobs=-1,
         verbosity=0,
     )
-    # P2-3 fix: 添加 early stopping 防止过拟合
-    # Ref: Chen & Guestrin (2016) KDD
-    from sklearn.model_selection import train_test_split as _xgb_tts
-    X_tr, X_eval, y_tr, y_eval = _xgb_tts(X_train, y_xgb, test_size=0.15, random_state=seed)
-    model.fit(X_tr, y_tr, eval_set=[(X_eval, y_eval)], early_stopping_rounds=20, verbose=False)
+    model.fit(X_train, y_xgb, verbose=False)
 
     # 风险分数 = exp(margin)，clip 防止指数溢出
     raw_pred = model.predict(X_all)
@@ -964,11 +1178,7 @@ def fit_super_learner(x, split, seed=RANDOM_SEED):
                     cv_predictions[val_idx, i] = m.predict(X_fold_val)
                 elif name == "xgb_cox":
                     y_xgb = np.where(fold_event == 1, fold_time, -fold_time)
-                    # P2-3 fix: Super Learner CV 中 XGB 也使用 early stopping
-                    _n_eval = max(2, int(len(X_fold_tr) * 0.15))
-                    m.fit(X_fold_tr[:-_n_eval], y_xgb[:-_n_eval],
-                          eval_set=[(X_fold_tr[-_n_eval:], y_xgb[-_n_eval:])],
-                          early_stopping_rounds=20, verbose=False)
+                    m.fit(X_fold_tr, y_xgb, verbose=False)
                     raw = m.predict(X_fold_val)
                     cv_predictions[val_idx, i] = np.exp(np.clip(raw, -30, 30))
             except Exception as e:
@@ -1002,11 +1212,7 @@ def fit_super_learner(x, split, seed=RANDOM_SEED):
                 final_models[name] = m
             elif name == "xgb_cox":
                 y_xgb = np.where(y_event_train == 1, y_time_train, -y_time_train)
-                # P2-3 fix: Super Learner 最终训练也使用 early stopping
-                _n_eval = max(2, int(len(X_train) * 0.15))
-                m.fit(X_train[:-_n_eval], y_xgb[:-_n_eval],
-                      eval_set=[(X_train[-_n_eval:], y_xgb[-_n_eval:])],
-                      early_stopping_rounds=20, verbose=False)  # X_train 非 X_all
+                m.fit(X_train, y_xgb, verbose=False)
                 final_models[name] = m
         except Exception as e:
             logger.info(f"  [Super Learner] full-data training {name} failed: {e}")
@@ -2128,11 +2334,33 @@ def main():
     parser.add_argument("--timestamp", type=str, required=True)
     parser.add_argument("--gan-epochs", type=int, default=300)
     parser.add_argument("--skip-gan", action="store_true")
+    parser.add_argument("--augment-method", choices=["gan", "vae", "none"],
+                        default="vae",
+                        help="数据增强方法: gan (原 WCGAN-GP) / vae (β-VAE) / none (跳过)")
+    parser.add_argument("--vae-epochs", type=int, default=800)
+    parser.add_argument("--vae-latent-dim", type=int, default=32)
+    parser.add_argument("--feature-select-k", type=int, default=0,
+                        help="LASSO 特征筛选目标维度, 0=不筛选")
+    parser.add_argument("--vae-condition", choices=["none", "survival"],
+                        default="none", help="VAE 条件类型: none (KNN标签) / survival (条件VAE)")
+    parser.add_argument("--pathway-features", choices=["none", "hallmark"],
+                        default="none", help="通路引导特征: none / hallmark")
     args = parser.parse_args()
 
     timestamp = args.timestamp
     gan_epochs = args.gan_epochs
     skip_gan = args.skip_gan
+    augment_method = args.augment_method
+    vae_epochs = args.vae_epochs
+    vae_latent_dim = args.vae_latent_dim
+    feature_select_k = args.feature_select_k
+    vae_condition = args.vae_condition
+    pathway_features_mode = args.pathway_features
+
+    # --skip-gan 向后兼容: 等价于 --augment-method none
+    if skip_gan and augment_method != "none":
+        augment_method = "none"
+        logger.info("[03] --skip-gan 已转换为 --augment-method none")
 
     out_dir = os.path.join(RESULTS_DIR, timestamp, "03_model_training")
     models_dir = os.path.join(out_dir, "models")
@@ -2303,6 +2531,17 @@ def main():
     if not fused_df.empty and fused_columns:
         feat_df = fused_df.set_index("PATIENT_ID")[fused_columns]
         feature_parts.append(feat_df)
+    # ── Step 1.5: 通路引导特征（可选）──────────────────────────────────
+    if pathway_features_mode == "hallmark" and not gene_expr.empty:
+        pw_df, pw_names, pw_cnts = build_pathway_features(gene_expr, patients)
+        if not pw_df.empty and pw_names:
+            pw_feat = pw_df.reindex(patients)
+            pw_feat.index = pw_feat.index.astype(str)
+            feature_parts.append(pw_feat)
+            logger.info(
+                f"[03] 通路特征已注入: {len(pw_names)} 维, "
+                f"通路={pw_names}"
+            )
     if not clin_x.empty:
         feature_parts.append(clin_x.reindex(clin_x.index.astype(str)))
     if candidate_genes and not gene_expr.empty:
@@ -2347,7 +2586,55 @@ def main():
             endpoint[dst] = clinical.set_index("PATIENT_ID")[src].reindex(endpoint.index)
     endpoint_train = endpoint.loc[endpoint.index.isin(train_ids)]
 
-    if not skip_gan and HAS_TORCH:
+    if augment_method == "vae" and HAS_TORCH and HAS_VAE_AUGMENTOR:
+        logger.info(
+            f"[03] Step 2: VAE augmentation "
+            f"(epochs={vae_epochs}, latent_dim={vae_latent_dim})..."
+        )
+        vae_result, vae_info = train_only_vae_augmentation(
+            X_all_imp, endpoint, train_ids,
+            vae_epochs=vae_epochs, latent_dim=vae_latent_dim, seed=RANDOM_SEED,
+            condition_type=vae_condition,
+        )
+        if vae_result is not None and vae_result.get("qc", {}).get("passed", False):
+            n_syn = vae_result["n_syn"]
+            syn_event = vae_result.get("syn_event", np.ones(n_syn, dtype=int))
+            syn_time = vae_result.get("syn_time", np.full(n_syn, FIXED_TAU_MONTHS))
+            X_train_aug = pd.concat(
+                [X_all_imp.loc[X_all_imp.index.isin(train_ids)],
+                 vae_result["X_aug"].iloc[len(train_ids):]],
+                ignore_index=True,
+            )
+            endpoint_train_aug = pd.DataFrame({
+                "time_months": np.concatenate([endpoint_train["time_months"].values, syn_time]),
+                "event": np.concatenate([endpoint_train["event"].values, syn_event]),
+            })
+            joblib.dump(vae_result["vae"], os.path.join(models_dir, "vae_augmentor.pkl"))
+            if "loss_history" in vae_result:
+                try:
+                    fig, ax = plt.subplots(figsize=(8, 4))
+                    lh = vae_result["loss_history"]
+                    for key in ("recon", "kl", "total"):
+                        if key in lh:
+                            ax.plot(lh[key], label=key, alpha=0.7)
+                    ax.set_xlabel("Epoch")
+                    ax.set_ylabel("Loss")
+                    ax.set_title("VAE Training Loss")
+                    ax.legend(loc="best", fontsize=8)
+                    fig.tight_layout()
+                    fig.savefig(os.path.join(fig_dir, "vae_training_loss.png"), dpi=200)
+                    plt.close(fig)
+                except Exception:
+                    pass
+            logger.info(f"[03] VAE augmentation: {n_syn} synthetic samples, QC passed")
+        else:
+            X_train_aug = X_all_imp.loc[X_all_imp.index.isin(train_ids)]
+            endpoint_train_aug = endpoint_train.copy()
+            logger.info(
+                f"[03] VAE augmentation: skipped or QC failed "
+                f"({vae_info.get('status', 'unknown')})"
+            )
+    elif augment_method == "gan" and HAS_TORCH:
         logger.info(f"[03] Step 2: GAN augmentation (epochs={gan_epochs})...")
         gan_result, gan_info = train_only_gan_augmentation(X_all_imp, endpoint, train_ids, gan_epochs, RANDOM_SEED)
         if gan_result is not None and gan_result.get("qc", {}).get("passed", False):
@@ -2387,12 +2674,61 @@ def main():
             endpoint_train_aug = endpoint_train.copy()
             logger.info(f"[03] GAN augmentation: skipped or QC failed ({gan_info.get('status', 'unknown')})")
     else:
-        if skip_gan:
-            logger.info("[03] Step 2: GAN skipped (--skip-gan)")
+        if augment_method == "none" or skip_gan:
+            logger.info(f"[03] Step 2: Augmentation skipped (method={augment_method})")
+        elif augment_method == "vae" and not HAS_VAE_AUGMENTOR:
+            logger.warning("[03] Step 2: VAE skipped (vae_augmentor 模块不可用)")
         else:
-            logger.info("[03] Step 2: GAN skipped (torch not available)")
+            logger.info("[03] Step 2: Augmentation skipped (torch not available)")
         X_train_aug = X_all_imp.loc[X_all_imp.index.isin(train_ids)]
         endpoint_train_aug = endpoint_train.copy()
+
+    # ── 增强数据注入：将合成样本扩展到全局数据结构 ──────────────────────
+    _augmentation_applied = False
+    if augment_method != "none" and HAS_TORCH:
+        if 'X_train_aug' in dir() and len(X_train_aug) > len(train_ids):
+            n_orig = len(X_all_imp)
+            n_syn = len(X_train_aug) - len(train_ids)
+            syn_feature_rows = X_train_aug.iloc[len(train_ids):].copy()
+            syn_feature_rows.index = [f"SYN_{augment_method.upper()}_{i:04d}" for i in range(n_syn)]
+            X_all_imp = pd.concat([X_all_imp, syn_feature_rows])
+            syn_split = pd.DataFrame({
+                "PATIENT_ID": [f"SYN_{augment_method.upper()}_{i:04d}" for i in range(n_syn)],
+                "split": "train",
+                "time_months": endpoint_train_aug["time_months"].values[len(train_ids):],
+                "event": endpoint_train_aug["event"].values[len(train_ids):],
+            })
+            split_df = pd.concat([split_df, syn_split], ignore_index=True)
+            _augmentation_applied = True
+            logger.info(
+                f"[03] 增强数据注入: X_all_imp {n_orig}->{len(X_all_imp)}, "
+                f"split_df train={len(split_df[split_df['split']=='train'])}"
+            )
+
+    # 重新定义 train_mask/valid_mask（基于扩展后的 split_df）
+    train_mask = split_df["PATIENT_ID"].isin(train_ids).to_numpy()
+    valid_mask = split_df["PATIENT_ID"].isin(valid_ids).to_numpy()
+
+    # ── Step 2.5: LASSO 特征筛选（可选）─────────────────────────────────
+    if feature_select_k > 0:
+        logger.info(f"[03] Step 2.5: LASSO 特征筛选 (target={feature_select_k})...")
+        # 仅在原始训练集（不含合成样本）上 fit LASSO
+        X_train_orig = X_all_imp.loc[X_all_imp.index.isin(train_ids)]
+        train_time_arr = split_df.loc[
+            split_df["PATIENT_ID"].isin(train_ids), "time_months"
+        ].values.astype(float)[:len(train_ids)]  # 仅原始训练样本
+        train_event_arr = split_df.loc[
+            split_df["PATIENT_ID"].isin(train_ids), "event"
+        ].values.astype(int)[:len(train_ids)]
+        selected_cols = select_features_lasso(
+            X_train_orig, train_time_arr, train_event_arr,
+            n_features_target=feature_select_k, seed=RANDOM_SEED,
+        )
+        X_all_imp = X_all_imp[selected_cols]
+        logger.info(
+            f"[03] Step 2.5: 特征筛选完成 {X_all_imp.shape[1]} 维, "
+            f"X_all_imp shape={X_all_imp.shape}"
+        )
 
     X_train = X_all_imp.loc[X_all_imp.index.isin(train_ids)]
     X_valid = X_all_imp.loc[X_all_imp.index.isin(valid_ids)]
@@ -2540,8 +2876,10 @@ def main():
         json.dump(selection_rationale, f, indent=2)
     logger.info(f"[03] Primary model selected: {best_model_name}")
 
-    train_time_arr = split_df.loc[split_df["split"] == "train", "time_months"].values.astype(float)
-    train_event_arr = split_df.loc[split_df["split"] == "train", "event"].values.astype(int)
+    # y_train_surv 仅用原始训练样本（不含合成样本），用于 tdAUC 计算
+    real_train_mask = split_df["PATIENT_ID"].isin(train_ids)
+    train_time_arr = split_df.loc[real_train_mask, "time_months"].values.astype(float)
+    train_event_arr = split_df.loc[real_train_mask, "event"].values.astype(int)
     valid_time_arr = split_df.loc[valid_mask, "time_months"].values.astype(float)
     valid_event_arr = split_df.loc[valid_mask, "event"].values.astype(int)
     y_train_surv = Surv.from_arrays(train_event_arr.astype(bool), train_time_arr) if Surv is not None else None
@@ -2682,8 +3020,12 @@ def main():
         "n_valid": int(valid_mask.sum()),
         "n_features": X_all_imp.shape[1],
         "n_candidate_genes": len(candidate_genes),
-        "gan_applied": not skip_gan and HAS_TORCH,
-        "gan_epochs": gan_epochs,
+        "augmentation_method": augment_method if augment_method != "none" else "skipped",
+        "gan_applied": augment_method == "gan" and HAS_TORCH,
+        "vae_applied": augment_method == "vae" and HAS_TORCH and HAS_VAE_AUGMENTOR,
+        "gan_epochs": gan_epochs if augment_method == "gan" else None,
+        "vae_epochs": vae_epochs if augment_method == "vae" else None,
+        "vae_latent_dim": vae_latent_dim if augment_method == "vae" else None,
         "models_trained": list(trained_models.keys()),
         "best_model": best_model_name,
         "best_c_index": eval_results.get(best_model_name, {}).get("c_index") if best_model_name else None,

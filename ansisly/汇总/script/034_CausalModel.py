@@ -1,29 +1,29 @@
-"""034_CausalModel.py — Meta-DeepSurv: MAML 元学习跨癌种少样本生存预测
+"""034_CausalModel.py — Meta-DeepSurv: Reptile 元学习跨癌种少样本生存预测
 
 因果深度生存模型变体 3（元学习迁移版）：
-使用 Model-Agnostic Meta-Learning (MAML) 框架，在多个源癌种
-(BRCA, LUAD, KIRC 等) 上学习鲁棒的参数初始化，然后在目标癌种
-(COAD/READ) 上仅用少量样本 (10-50) 快速微调。
+使用 Reptile 元学习框架，在多个源癌种
+(BRCA, LUAD, KIRC, LIHC, UCEC, STAD, ESCA, PAAD) 上学习鲁棒的
+参数初始化，然后在目标癌种 (COAD/READ) 上仅用少量样本快速微调。
 
 核心差异 (vs 031 / 032 / 033):
-    - 完全不同的泛化策略：元学习 (MAML) 而非因果编码/IB/扩散增强
-    - 跨癌种训练：利用 TCGA 多癌种数据作为 source tasks
-    - 少样本适应：目标癌种仅需 10-50 样本即可微调
+    - 完全不同的泛化策略：元学习 (Reptile) 而非因果编码/IB/扩散增强
+    - 跨癌种训练：利用 TCGA 多癌种真实数据作为 source tasks
+    - 少样本适应：目标癌种仅需少量样本即可微调
     - 参考 MMOSurv (Bioinformatics 2024) 的 Reptile 元学习框架
     - 不使用 CausalEGM/IB/对抗去混杂/对比学习
 
 架构：
-    X → MetaEncoder [512→256→128→Z] → SurvivalHead [64→32→1] → log risk
-    MAML 内循环: K 步 SGD on support set → 外循环: 更新全局参数
+    X → MetaEncoder [256→128→Z] → SurvivalHead [64→32→1] → log risk
+    Reptile 内循环: K 步 SGD on support set → 外循环: 参数插值更新
 
-损失函数：
-    L_meta = E_{tasks} [ L_IPCW(theta'_i) ]
-    theta'_i = theta - alpha * grad(L_support(theta))
+Reptile 更新规则：
+    theta = theta + meta_lr * (theta' - theta)
+    theta' = fine-tuned params after K inner-loop SGD steps
 
 参考文献：
-    - MAML: Finn et al., ICML 2017
-    - MMOSurv: Wen & Li, Bioinformatics 2024 (Reptile 元学习)
     - Reptile: Nichol et al., arXiv 2018
+    - MMOSurv: Wen & Li, Bioinformatics 2024 (Reptile 元学习)
+    - MAML: Finn et al., ICML 2017
 """
 
 from __future__ import annotations
@@ -93,17 +93,20 @@ META_DEEPSURV_CONFIG: Dict[str, Any] = {
     "latent_dim": 64,                # 潜在表征维度
     "survival_hidden": [64, 32],     # SurvivalHead 隐层
     "dropout": 0.3,
-    # MAML 元学习
-    "meta_lr": 1e-3,                 # 外循环学习率 (meta-optimizer)
+    # Reptile 元学习
+    "meta_lr": 1e-3,                 # Reptile 外循环插值系数
     "inner_lr": 1e-2,                # 内循环学习率 (task-specific SGD)
     "inner_steps": 5,                # 内循环 K 步
     "n_way": 1,                      # 每个 task 的类别数 (生存=1)
     "k_support": 30,                 # support set 大小
     "k_query": 20,                   # query set 大小
     # 源癌种 (用于元训练)
-    "source_cancers": ["BRCA", "LUAD", "KIRC", "LIHC", "UCEC"],
+    # 当 real_multicancer_dir 有数据时仅使用有文件的癌种;
+    # 回退模拟模式时使用全部 8 个名称切分 COAD 数据
+    "source_cancers": ["STAD", "ESCA", "PAAD",
+                       "BRCA", "LUAD", "KIRC", "LIHC", "UCEC"],
     # 训练
-    "meta_epochs": 200,              # 元训练轮数
+    "meta_epochs": 300,              # 元训练轮数
     "finetune_epochs": 100,          # 目标癌种微调轮数
     "finetune_lr": 1e-3,
     "batch_size": 32,
@@ -113,6 +116,13 @@ META_DEEPSURV_CONFIG: Dict[str, Any] = {
     # 损失
     "lambda_rank": 0.3,
     "lambda_elastic": 1e-4,
+    # 真实多癌种数据:
+    #   real_multicancer_dir=None 时回退到 COAD 模拟切分
+    #   use_real_multicancer=False 时强制模拟模式（即使目录存在）
+    "real_multicancer_dir": os.path.join(
+        os.path.dirname(os.path.dirname(_SCRIPT_DIR)), "rawData", "multicancer_preprocessed"
+    ),
+    "use_real_multicancer": True,   # 开关: True=启用真实数据, False=强制模拟
     # 评估
     "eval_tau_months": 36,
     "random_seed": RANDOM_SEED,
@@ -183,12 +193,11 @@ if HAS_TORCH:
             return self.net(z).squeeze(-1)
 
     class MetaDeepSurv(nn.Module):
-        """MAML 元学习 DeepSurv 模型。
+        """Reptile 元学习 DeepSurv 模型。
 
         与 031/032/033 完全不同的模型类设计：
-        1. 支持 MAML 内循环手动梯度更新 (functional forward)
-        2. 提供 clone() 方法创建 task-specific 副本
-        3. 无 IB/对抗/对比/扩散组件
+        1. Reptile 元学习：内循环 SGD + 外循环参数插值
+        2. 无 IB/对抗/对比/扩散组件
 
         架构: MetaEncoder → MetaSurvivalHead → log risk
         """
@@ -209,60 +218,6 @@ if HAS_TORCH:
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             z = self.encoder(x)
             return self.surv_head(z)
-
-        def functional_forward(
-            self, x: torch.Tensor, params: Dict[str, torch.Tensor],
-        ) -> torch.Tensor:
-            """函数式前向传播 (MAML 内循环用)。
-
-            使用外部传入的参数而非 self.parameters()，
-            支持手动梯度更新。
-
-            Args:
-                x: 输入特征
-                params: 命名参数字典
-
-            Returns:
-                log risk scores
-            """
-            # 编码器前向
-            h = x
-            layer_idx = 0
-            for module in self.encoder.net:
-                if isinstance(module, nn.Linear):
-                    w_key = f"encoder.net.{layer_idx}.weight"
-                    b_key = f"encoder.net.{layer_idx}.bias"
-                    h = F.linear(h, params[w_key], params[b_key])
-                elif isinstance(module, nn.LayerNorm):
-                    w_key = f"encoder.net.{layer_idx}.weight"
-                    b_key = f"encoder.net.{layer_idx}.bias"
-                    h = F.layer_norm(h, module.normalized_shape, params[w_key], params[b_key], module.eps)
-                elif isinstance(module, nn.ReLU):
-                    h = F.relu(h)
-                elif isinstance(module, nn.Dropout):
-                    if self.training:
-                        h = F.dropout(h, p=module.p, training=True)
-                layer_idx += 1
-
-            # 生存头前向
-            layer_idx = 0
-            for module in self.surv_head.net:
-                if isinstance(module, nn.Linear):
-                    w_key = f"surv_head.net.{layer_idx}.weight"
-                    b_key = f"surv_head.net.{layer_idx}.bias"
-                    h = F.linear(h, params[w_key], params[b_key])
-                elif isinstance(module, nn.GELU):
-                    h = F.gelu(h)
-                elif isinstance(module, nn.Dropout):
-                    if self.training:
-                        h = F.dropout(h, p=module.p, training=True)
-                layer_idx += 1
-
-            return h.squeeze(-1)
-
-        def get_named_params(self) -> Dict[str, torch.Tensor]:
-            """获取可更新的命名参数副本。"""
-            return {name: param.clone() for name, param in self.named_parameters()}
 
         def predict_risk(self, x: torch.Tensor) -> np.ndarray:
             """推理接口。"""
@@ -314,36 +269,198 @@ if HAS_TORCH:
 
         return l_partial + cfg["lambda_rank"] * l_rank
 
-    def compute_meta_survival_loss_functional(
-        model: MetaDeepSurv,
-        params: Dict[str, torch.Tensor],
-        x: torch.Tensor,
-        times: torch.Tensor,
-        events: torch.Tensor,
-        config: Optional[Dict[str, Any]] = None,
-    ) -> torch.Tensor:
-        """函数式损失 (MAML 内循环用)。"""
-        log_risk = model.functional_forward(x, params)
-        return compute_meta_survival_loss(log_risk, times, events, config)
-
-
 # ══════════════════════════════════════════════════════════════════════
 # 数据加载与 Task 构建
 # ══════════════════════════════════════════════════════════════════════
+
+def _load_single_cancer_real(
+    cancer_type: str, data_dir: str, shared_genes: List[str],
+) -> Dict[str, np.ndarray]:
+    """加载单个癌种的真实表达+生存数据，对齐到共享基因集。"""
+    cancer_upper = cancer_type.upper()
+    expr_file = os.path.join(data_dir, f"{cancer_upper}_gene_expression.tsv")
+    clin_file = os.path.join(data_dir, f"{cancer_upper}_os_clinical.tsv")
+
+    if not os.path.exists(expr_file) or not os.path.exists(clin_file):
+        raise FileNotFoundError(f"{cancer_type}: 数据文件不存在")
+
+    expr = pd.read_csv(expr_file, sep="\t", index_col=0)
+    clin = pd.read_csv(clin_file, sep="\t")
+    # 统一列名：部分文件用 patient_id，部分用 PATIENT_ID
+    _id_col = "patient_id" if "patient_id" in clin.columns else [c for c in clin.columns if c.upper() == "PATIENT_ID"]
+    if not isinstance(_id_col, str):
+        _id_col = _id_col[0] if _id_col else "patient_id"
+    clin.rename(columns={_id_col: "patient_id"}, inplace=True)
+
+    # 对齐基因 (严格使用 shared_genes，缺失基因填 0)
+    avail = [g for g in shared_genes if g in expr.columns]
+    if len(avail) < 50:
+        raise ValueError(f"{cancer_type}: 共享基因仅 {len(avail)} 个")
+    expr = expr[avail]
+    expr = expr.reindex(columns=shared_genes, fill_value=0.0)
+
+    clin["patient_id"] = clin["patient_id"].astype(str).map(normalize_patient_id)
+    clin["time_months"] = pd.to_numeric(clin["time_months"], errors="coerce")
+    clin["event"] = coerce_event(clin["event"]).astype(int)
+    clin = clin[clin["patient_id"].ne("") & clin["time_months"].notna() & (clin["time_months"] > 0)]
+    clin.index = clin["patient_id"].values
+
+    common = expr.index.intersection(clin.index)
+    if len(common) < 20:
+        raise ValueError(f"{cancer_type}: 对齐后仅 {len(common)} 样本")
+
+    X = expr.loc[common].fillna(0.0)
+    scaler = StandardScaler()
+    X_scaled = pd.DataFrame(scaler.fit_transform(X), index=X.index, columns=shared_genes)
+
+    return {
+        "X": X_scaled.to_numpy(dtype=np.float32),
+        "times": clin.loc[common, "time_months"].to_numpy(dtype=np.float32),
+        "events": clin.loc[common, "event"].to_numpy(dtype=np.float32),
+        "n_samples": len(common),
+        "n_genes": len(shared_genes),
+    }
+
 
 def load_tcga_multi_cancer(
     timestamp: str, config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """加载 TCGA 多癌种数据。
 
-    返回 dict: {cancer_type: {X, times, events, gene_names}}
-
-    注: 当仅有 COAD/READ 数据时，通过 bootstrap 采样模拟多 task。
+    支持两种模式:
+    1. 真实多癌种: 当 real_multicancer_dir 存在且包含数据时
+    2. 模拟多 task: 仅用 COAD 数据随机切分 (回退模式)
     """
     cfg = config or META_DEEPSURV_CONFIG
-    preproc_dir = ESSENTIAL_DIR
+    real_dir = cfg.get("real_multicancer_dir")
+    use_real = cfg.get("use_real_multicancer", True)
 
-    # 加载 COAD 数据
+    # ── 尝试真实多癌种数据 ──
+    if real_dir and os.path.isdir(real_dir) and use_real:
+        logger.info(f"[MetaDeepSurv] 使用真实多癌种数据: {real_dir}")
+        # 第一遍: 收集各癌种 top-k 基因
+        gene_sets = {}
+        for cancer in cfg["source_cancers"]:
+            expr_f = os.path.join(real_dir, f"{cancer.upper()}_gene_expression.tsv")
+            if os.path.exists(expr_f):
+                df = pd.read_csv(expr_f, sep="\t", index_col=0, nrows=5)
+                var_all = pd.read_csv(expr_f, sep="\t", index_col=0).var(axis=0, skipna=True)
+                var_all = var_all[var_all > 0].sort_values(ascending=False)
+                gene_sets[cancer] = set(var_all.head(cfg["variance_topk"]).index)
+            else:
+                logger.warning(f"[{cancer}] 数据文件不存在，跳过")
+
+        # 共享基因: 至少 N-2 个癌种共有 (去重 + top-k)
+        if gene_sets:
+            n_required = max(len(gene_sets) - 2, 1)
+            from collections import Counter
+            gene_counts = Counter(g for gs in gene_sets.values() for g in gs)
+            # 先收集满足条件的基因（保持方差排序顺序）
+            all_candidate_genes = []
+            seen = set()
+            for gs in gene_sets.values():
+                for g in gs:
+                    if g not in seen and gene_counts[g] >= n_required:
+                        all_candidate_genes.append(g)
+                        seen.add(g)
+            shared_genes = all_candidate_genes[:cfg["variance_topk"]]
+            logger.info(f"  共享基因: {len(shared_genes)} (去重后, 至少{n_required}个癌种共有)")
+        else:
+            shared_genes = []
+
+        # 第二遍: 加载数据
+        task_data = {}
+        for cancer in cfg["source_cancers"]:
+            if cancer not in gene_sets:
+                continue
+            try:
+                task_data[cancer] = _load_single_cancer_real(cancer, real_dir, shared_genes)
+                logger.info(f"  [{cancer}] {task_data[cancer]['n_samples']} 样本, "
+                            f"{task_data[cancer]['n_genes']} 基因")
+            except Exception as e:
+                logger.warning(f"  [{cancer}] 加载失败: {e}")
+
+        if len(task_data) >= 3:
+            # 目标 task: COAD，使用相同共享基因集
+            target_data = _load_coad_target(cfg, shared_genes)
+            return {
+                "source_tasks": task_data,
+                "target": target_data,
+                "gene_names": shared_genes,
+                "input_dim": len(shared_genes),
+            }
+        logger.warning("真实数据加载不足 3 个癌种，回退到模拟模式")
+
+    # ── 回退: COAD 模拟多 task ──
+    return _load_simulated_multitask(cfg)
+
+
+def _load_coad_target(cfg: Dict[str, Any], shared_genes: Optional[List[str]] = None) -> Dict[str, Any]:
+    """加载 COAD 目标 task (train/val)。
+
+    Args:
+        cfg: 配置
+        shared_genes: 若提供，COAD 表达数据将过滤为仅这些基因（与 source tasks 对齐）
+    """
+    preproc_dir = ESSENTIAL_DIR
+    clinical = safe_read_tsv(os.path.join(preproc_dir, "tcga_os_clinical_endpoint_qc.tsv"))
+    time_col, event_col = detect_event_time_columns(clinical)
+    ep = clinical.copy()
+    ep["PATIENT_ID"] = ep["PATIENT_ID"].astype(str).map(normalize_patient_id)
+    ep["time_months"] = pd.to_numeric(ep[time_col], errors="coerce")
+    ep["event"] = coerce_event(ep[event_col]).astype(int)
+    ep = ep[ep["PATIENT_ID"].ne("") & ep["time_months"].notna() & (ep["time_months"] >= 0)]
+    ep.index = ep["PATIENT_ID"].values
+
+    expr_df = safe_read_tsv(os.path.join(preproc_dir, "gene_expression_curated.tsv"), index_col=0)
+    expr_df = expr_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    # 过滤到共享基因集（与 source tasks 对齐）
+    if shared_genes is not None:
+        avail = [g for g in shared_genes if g in expr_df.columns]
+        missing = [g for g in shared_genes if g not in expr_df.columns]
+        expr_df = expr_df[avail]
+        expr_df = expr_df.reindex(columns=shared_genes, fill_value=0.0)
+        logger.info(f"[MetaDeepSurv] COAD target: 使用 {len(shared_genes)} 共享基因 "
+                    f"({len(avail)} 可用, {len(missing)} 填零)")
+
+    split_path = os.path.join(preproc_dir, "tcga_train_internal_validation_split.tsv")
+    if not os.path.exists(split_path):
+        split_path = os.path.join(DATA_DIR, "survival_models", "tcga_train_internal_validation_split.tsv")
+    if os.path.exists(split_path):
+        split_df = safe_read_tsv(split_path)
+        train_ids = set(split_df.loc[split_df["split"] == "train", "PATIENT_ID"].astype(str))
+        val_ids = set(split_df.loc[split_df["split"] != "train", "PATIENT_ID"].astype(str))
+    else:
+        rng = np.random.RandomState(cfg["random_seed"])
+        all_ids = list(ep.index)
+        rng.shuffle(all_ids)
+        sp = int(0.8 * len(all_ids))
+        train_ids, val_ids = set(all_ids[:sp]), set(all_ids[sp:])
+
+    common_tr = expr_df.index.intersection(ep.index)
+    X_all = expr_df.loc[common_tr].fillna(0.0)
+    scaler = StandardScaler()
+    X_scaled = pd.DataFrame(scaler.fit_transform(X_all), index=X_all.index, columns=X_all.columns)
+
+    tr_mask = X_scaled.index.isin(train_ids)
+    va_mask = X_scaled.index.isin(val_ids)
+    ep_tr = ep.loc[ep.index.isin(train_ids)]
+    ep_va = ep.loc[ep.index.isin(val_ids)]
+
+    return {
+        "X_train": X_scaled[tr_mask].to_numpy(dtype=np.float32),
+        "times_train": ep_tr["time_months"].to_numpy(dtype=np.float32),
+        "events_train": ep_tr["event"].to_numpy(dtype=np.float32),
+        "X_val": X_scaled[va_mask].to_numpy(dtype=np.float32),
+        "times_val": ep_va["time_months"].to_numpy(dtype=np.float32),
+        "events_val": ep_va["event"].to_numpy(dtype=np.float32),
+    }
+
+
+def _load_simulated_multitask(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """回退模式: 仅用 COAD 数据，随机切分模拟多 source tasks。"""
+    preproc_dir = ESSENTIAL_DIR
     clinical = safe_read_tsv(os.path.join(preproc_dir, "tcga_os_clinical_endpoint_qc.tsv"))
     expr_df = safe_read_tsv(os.path.join(preproc_dir, "gene_expression_curated.tsv"), index_col=0)
     expr_df = expr_df.apply(pd.to_numeric, errors="coerce")
@@ -356,24 +473,20 @@ def load_tcga_multi_cancer(
     ep = ep[ep["PATIENT_ID"].ne("") & ep["time_months"].notna() & (ep["time_months"] >= 0)]
     ep.index = ep["PATIENT_ID"].values
 
-    # 方差过滤
     variances = expr_df.var(axis=0, skipna=True).dropna()
     variances = variances[variances > 0].sort_values(ascending=False)
     topk_genes = list(variances.head(cfg["variance_topk"]).index)
 
-    # 标准化
     X_all = expr_df[topk_genes].copy()
     X_all.index = X_all.index.astype(str)
     X_all = X_all.fillna(X_all.median()).fillna(0.0)
     scaler = StandardScaler()
     X_scaled = pd.DataFrame(scaler.fit_transform(X_all), index=X_all.index, columns=topk_genes)
 
-    # 对齐
     common_idx = X_scaled.index.intersection(ep.index)
     X_aligned = X_scaled.loc[common_idx]
     ep_aligned = ep.loc[common_idx]
 
-    # 划分 train/val
     split_path = os.path.join(preproc_dir, "tcga_train_internal_validation_split.tsv")
     if not os.path.exists(split_path):
         split_path = os.path.join(DATA_DIR, "survival_models", "tcga_train_internal_validation_split.tsv")
@@ -382,7 +495,6 @@ def load_tcga_multi_cancer(
         train_ids = set(split_df.loc[split_df["split"] == "train", "PATIENT_ID"].astype(str))
         val_ids = set(split_df.loc[split_df["split"] != "train", "PATIENT_ID"].astype(str))
     else:
-        # 80/20 随机划分
         rng = np.random.RandomState(cfg["random_seed"])
         all_ids = list(X_aligned.index)
         rng.shuffle(all_ids)
@@ -390,28 +502,23 @@ def load_tcga_multi_cancer(
         train_ids = set(all_ids[:split_point])
         val_ids = set(all_ids[split_point:])
 
-    train_mask = X_aligned.index.isin(train_ids)
-    val_mask = X_aligned.index.isin(val_ids)
-
-    X_train = X_aligned[train_mask]
-    X_val = X_aligned[val_mask]
+    X_train = X_aligned[X_aligned.index.isin(train_ids)]
+    X_val = X_aligned[X_aligned.index.isin(val_ids)]
     ep_train = ep_aligned[ep_aligned.index.isin(train_ids)]
     ep_val = ep_aligned[ep_aligned.index.isin(val_ids)]
 
-    logger.info(f"[MetaDeepSurv] COAD train={len(X_train)}, val={len(X_val)}")
+    logger.info(f"[MetaDeepSurv] COAD(模拟) train={len(X_train)}, val={len(X_val)}")
 
-    # 构建模拟多 task (通过随机划分训练集为多个 subtask)
     n_tasks = len(cfg["source_cancers"])
     task_data = {}
     rng = np.random.RandomState(cfg["random_seed"])
     train_indices = np.arange(len(X_train))
-    task_size = max(len(train_indices) // (n_tasks + 1), 30)
+    task_size = max(len(train_indices) // (n_tasks + 1), 25)
 
     for i, cancer in enumerate(cfg["source_cancers"]):
         start = i * task_size
         end = min(start + task_size, len(train_indices))
         if end - start < 20:
-            # 不够样本则随机采样
             idx = rng.choice(len(train_indices), min(task_size, len(train_indices)), replace=False)
         else:
             idx = train_indices[start:end]
@@ -421,7 +528,6 @@ def load_tcga_multi_cancer(
             "events": ep_train.iloc[idx]["event"].to_numpy(dtype=np.float32),
         }
 
-    # 目标 task (COAD 剩余样本)
     remaining_idx = train_indices[n_tasks * task_size:]
     if len(remaining_idx) < 30:
         remaining_idx = rng.choice(train_indices, min(50, len(train_indices)), replace=False)
@@ -463,7 +569,7 @@ def harrell_cindex(times: np.ndarray, events: np.ndarray, risk: np.ndarray) -> f
 
 
 # ══════════════════════════════════════════════════════════════════════
-# MAML 元训练
+# Reptile 元训练
 # ══════════════════════════════════════════════════════════════════════
 
 if HAS_TORCH:
@@ -473,18 +579,18 @@ if HAS_TORCH:
         source_tasks: Dict[str, Dict[str, np.ndarray]],
         config: Optional[Dict[str, Any]] = None,
     ) -> MetaDeepSurv:
-        """MAML 元训练 (Reptile 风格)。
+        """Reptile 元训练。
 
         与 031/032/033 完全不同的训练范式：
         - 031/032/033: 在单一训练集上端到端训练
-        - 034: 在多个 source tasks 上元训练，学习参数初始化
+        - 034: 在多个 source tasks 上元训练，学习跨任务通用初始化
 
-        Reptile 算法 (简化版 MAML):
+        Reptile 算法:
             for each meta_epoch:
                 1. 采样一个 task
-                2. 克隆当前参数
-                3. 在 task 上执行 K 步 SGD (内循环)
-                4. 更新全局参数: theta += meta_lr * (theta' - theta)
+                2. 保存当前参数 theta
+                3. 在 task 上执行 K 步 SGD 得到 theta'
+                4. 参数插值: theta += meta_lr * (theta' - theta)
 
         Args:
             model: 全局模型
@@ -496,7 +602,6 @@ if HAS_TORCH:
         """
         cfg = config or META_DEEPSURV_CONFIG
         device = next(model.parameters()).device
-        meta_optimizer = torch.optim.Adam(model.parameters(), lr=cfg["meta_lr"])
         task_names = list(source_tasks.keys())
         rng = np.random.RandomState(cfg["random_seed"])
 
@@ -533,21 +638,24 @@ if HAS_TORCH:
                 loss.backward()
                 inner_optimizer.step()
 
-            # 外循环: 在 query set 上评估并更新全局参数
-            model.train()
-            log_risk_q = model(X_task[query_idx])
-            meta_loss = compute_meta_survival_loss(
-                log_risk_q, t_task[query_idx], e_task[query_idx], cfg,
-            )
-            meta_optimizer.zero_grad()
-            meta_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
-            meta_optimizer.step()
+            # ── Reptile 外循环: 参数插值 theta += meta_lr * (theta' - theta) ──
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    param.data.add_(
+                        cfg["meta_lr"] * (param.data - initial_params[name])
+                    )
 
+            # query set 监控日志 (不参与梯度更新)
             if (meta_ep + 1) % 50 == 0:
+                model.eval()
+                with torch.no_grad():
+                    log_risk_q = model(X_task[query_idx])
+                    monitor_loss = compute_meta_survival_loss(
+                        log_risk_q, t_task[query_idx], e_task[query_idx], cfg,
+                    )
                 logger.info(
                     f"[MetaDeepSurv] Meta-epoch {meta_ep+1}/{cfg['meta_epochs']}: "
-                    f"meta_loss={meta_loss.item():.4f}, task={task_name}"
+                    f"monitor_loss={monitor_loss.item():.4f}, task={task_name}"
                 )
 
         logger.info("[MetaDeepSurv] 元训练完成")
@@ -565,7 +673,7 @@ if HAS_TORCH:
     ) -> Tuple[MetaDeepSurv, Dict[str, Any]]:
         """在目标癌种 (COAD) 上微调元训练后的模型。
 
-        利用 MAML 学到的参数初始化，仅用少量样本快速收敛。
+        利用 Reptile 学到的参数初始化，仅用少量样本快速收敛。
 
         Args:
             model: 元训练后的模型
@@ -667,7 +775,7 @@ def run_meta_deepsurv_pipeline(
 ) -> Dict[str, Any]:
     """Meta-DeepSurv 端到端管线。
 
-    流程: 多癌种数据加载 → MAML 元训练 → 目标癌种微调 → 评估
+    流程: 多癌种数据加载 → Reptile 元训练 → 目标癌种微调 → 评估
 
     与 031/032/033 完全不同的训练范式。
     """
@@ -681,7 +789,7 @@ def run_meta_deepsurv_pipeline(
         return {}
 
     logger.info("=" * 60)
-    logger.info("[MetaDeepSurv] MAML 元学习跨癌种少样本生存预测")
+    logger.info("[MetaDeepSurv] Reptile 元学习跨癌种少样本生存预测")
     logger.info("=" * 60)
 
     # 1. 数据加载
@@ -693,9 +801,9 @@ def run_meta_deepsurv_pipeline(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    # 3. MAML 元训练
+    # 3. Reptile 元训练
     logger.info("=" * 40)
-    logger.info("[MetaDeepSurv] Phase 1: MAML 元训练")
+    logger.info("[MetaDeepSurv] Phase 1: Reptile 元训练")
     logger.info("=" * 40)
     model = maml_meta_train(model, data["source_tasks"], cfg)
 
@@ -746,7 +854,7 @@ def run_meta_deepsurv_pipeline(
     # 6. 保存
     elapsed = time.time() - t0
     summary = {
-        "model_type": "Meta-DeepSurv (MAML cross-cancer few-shot)",
+        "model_type": "Meta-DeepSurv (Reptile cross-cancer few-shot)",
         "timestamp": timestamp,
         "elapsed_sec": round(elapsed, 1),
         "input_dim": input_dim,
@@ -830,7 +938,7 @@ def _plot_km_curves(
 
 def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser(description="034: Meta-DeepSurv (MAML 元学习)")
+    parser = argparse.ArgumentParser(description="034: Meta-DeepSurv (Reptile 元学习)")
     parser.add_argument("--timestamp", type=str, required=True)
     args = parser.parse_args()
     try:
