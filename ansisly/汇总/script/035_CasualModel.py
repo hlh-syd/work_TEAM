@@ -3917,6 +3917,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--gate-alpha", type=float, default=None)
     parser.add_argument("--gate-max-iter", type=int, default=None)
     parser.add_argument("--source-bootstraps", type=int, default=None)
+    parser.add_argument("--gate-l0-weight", type=float, default=None)
+    parser.add_argument("--gate-count-weight", type=float, default=None)
+    parser.add_argument("--elastic-l1", type=float, default=None)
+    parser.add_argument("--elastic-l2", type=float, default=None)
     return parser.parse_args(argv)
 
 
@@ -3935,6 +3939,10 @@ def build_config(args: argparse.Namespace) -> CMIBConfig:
         "unlock_internal_validation": args.unlock_internal_validation,
         "output_dir": args.output_dir,
         "source_gate_bootstraps": args.source_bootstraps,
+        "gate_l0_weight": args.gate_l0_weight,
+        "gate_count_weight": args.gate_count_weight,
+        "elastic_l1": args.elastic_l1,
+        "elastic_l2": args.elastic_l2,
     }
     for name, value in cli_values.items():
         if value is not None:
@@ -3977,6 +3985,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _GATE_PRIOR_ALPHA,
         _GATE_PRIOR_MAX_ITER,
         config.source_gate_bootstraps,
+    )
+    LOGGER.info(
+        "Regularizer weights: gate_l0=%s gate_count=%s elastic_l1=%s elastic_l2=%s",
+        config.gate_l0_weight,
+        config.gate_count_weight,
+        config.elastic_l1,
+        config.elastic_l2,
     )
     if config.scope == "development":
         result = run_development_pipeline(config, output_dir)

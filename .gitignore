@@ -66,6 +66,9 @@ __pycache__/
 !ansisly/汇总/script/deepsurv_head.py
 !ansisly/汇总/script/gain_imputer.py
 !ansisly/汇总/script/vae_augmentor.py
+!ansisly/汇总/script/grid_search_gate_prior.py
+!ansisly/汇总/script/grid_search_regularizers.py
+
 
 # =============================================================================
 # 新增文件时：在 Layer 4 添加 !<具体路径> 即可
