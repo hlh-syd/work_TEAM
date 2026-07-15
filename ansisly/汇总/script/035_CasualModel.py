@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import warnings
 import random
 import sys
 import time
@@ -35,6 +36,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import rankdata
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.metrics import pairwise_distances
@@ -78,6 +80,8 @@ except ImportError:  # pragma: no cover - supports importlib loading in tests
 
 LOGGER = logging.getLogger("cmib_surv")
 SOURCE_CANCERS = ("STAD", "ESCA", "PAAD", "BRCA", "LUAD", "KIRC", "LIHC", "UCEC")
+_GATE_PRIOR_ALPHA: float = 0.02
+_GATE_PRIOR_MAX_ITER: int = 2000
 DEFAULT_CLINICAL_COLUMNS = ("AGE", "SEX", "AJCC_STAGE_ENCODED")
 DEFAULT_TARGET_EXPRESSION = Path(ESSENTIAL_DIR) / "gene_expression_curated.tsv"
 DEFAULT_TARGET_CLINICAL = Path(ESSENTIAL_DIR) / "tcga_os_clinical_endpoint_qc.tsv"
@@ -183,6 +187,7 @@ class CMIBConfig:
     gate_l0_weight: float = 2e-4
     gate_count_weight: float = 2e-3
     gate_bootstraps: int = 30
+    source_gate_bootstraps: int = 15
     elastic_l1: float = 2e-5
     elastic_l2: float = 2e-5
     domain_weight: float = 0.02
@@ -2290,14 +2295,31 @@ def _bootstrap_gate_prior(
         if HAS_SKSURV:
             try:
                 estimator = CoxnetSurvivalAnalysis(
-                    l1_ratio=0.7,
-                    alphas=[0.05],
-                    max_iter=8000,
-                    tol=1e-5,
+                    l1_ratio=0.5,
+                    alphas=[_GATE_PRIOR_ALPHA],
+                    max_iter=_GATE_PRIOR_MAX_ITER,
+                    tol=1e-3,
                 )
                 outcome = Surv.from_arrays(event_array[indices], time_array[indices])
-                estimator.fit(x[indices], outcome)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    estimator.fit(x[indices], outcome)
                 coefficient = np.abs(np.asarray(estimator.coef_[:, 0], dtype=float))
+            except Exception:
+                coefficient = None
+        if coefficient is None or not np.isfinite(coefficient).all() or coefficient.max() == 0:
+            # 优先 ridge Cox 兜底（保留删失结构），失败再退回单变量相关
+            try:
+                ridge = CoxPHSurvivalAnalysis(alpha=1.0, n_iter=200)
+                ridge_outcome = Surv.from_arrays(event_array[indices], time_array[indices])
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    ridge.fit(x[indices], ridge_outcome)
+                ridge_coef = np.asarray(ridge.coef_, dtype=float)
+                if np.isfinite(ridge_coef).all() and ridge_coef.max() > 0:
+                    coefficient = np.abs(ridge_coef)
+                else:
+                    coefficient = None
             except Exception:
                 coefficient = None
         if coefficient is None or not np.isfinite(coefficient).all() or coefficient.max() == 0:
@@ -2680,7 +2702,9 @@ def fit_elastic_net_cox(
             max_iter=100000,
             tol=1e-7,
         )
-        estimator.fit(x_train, outcome)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            estimator.fit(x_train, outcome)
         alpha_index = len(estimator.alphas_) // 2
         alpha = float(estimator.alphas_[alpha_index])
         coefficient = np.asarray(estimator.coef_[:, alpha_index], dtype=float)
@@ -2688,7 +2712,9 @@ def fit_elastic_net_cox(
     except Exception as error:
         LOGGER.warning("Coxnet failed (%s); using ridge Cox guardrail", error)
         estimator = CoxPHSurvivalAnalysis(alpha=1.0, n_iter=200)
-        estimator.fit(x_train, outcome)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            estimator.fit(x_train, outcome)
         coefficient = np.asarray(estimator.coef_, dtype=float)
         alpha = 1.0
         kind = "ridge_cox"
@@ -3618,7 +3644,7 @@ def run_development_pipeline(
     source_priors = compute_source_gate_priors(
         source_tasks,
         target_actives=candidate_actives,
-        bootstraps=config.gate_bootstraps,
+        bootstraps=config.source_gate_bootstraps,
         seed=config.seed,
     )
     register_source_gate_priors(source_priors)
@@ -3888,6 +3914,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--bundle", help="Frozen development bundle required for locked scope")
     parser.add_argument("--output-dir")
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--gate-alpha", type=float, default=None)
+    parser.add_argument("--gate-max-iter", type=int, default=None)
+    parser.add_argument("--source-bootstraps", type=int, default=None)
     return parser.parse_args(argv)
 
 
@@ -3905,6 +3934,7 @@ def build_config(args: argparse.Namespace) -> CMIBConfig:
         "enable_diffusion_qc": args.enable_diffusion_qc,
         "unlock_internal_validation": args.unlock_internal_validation,
         "output_dir": args.output_dir,
+        "source_gate_bootstraps": args.source_bootstraps,
     }
     for name, value in cli_values.items():
         if value is not None:
@@ -3916,6 +3946,11 @@ def build_config(args: argparse.Namespace) -> CMIBConfig:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     config = build_config(args)
+    global _GATE_PRIOR_ALPHA, _GATE_PRIOR_MAX_ITER
+    if args.gate_alpha is not None:
+        _GATE_PRIOR_ALPHA = args.gate_alpha
+    if args.gate_max_iter is not None:
+        _GATE_PRIOR_MAX_ITER = args.gate_max_iter
     output_dir = (
         Path(config.output_dir)
         if config.output_dir
@@ -3936,6 +3971,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         config.profile,
         config.scope,
         config.causal_mode,
+    )
+    LOGGER.info(
+        "Gate prior params: alpha=%s max_iter=%s source_bootstraps=%s",
+        _GATE_PRIOR_ALPHA,
+        _GATE_PRIOR_MAX_ITER,
+        config.source_gate_bootstraps,
     )
     if config.scope == "development":
         result = run_development_pipeline(config, output_dir)
