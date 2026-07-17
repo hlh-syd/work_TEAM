@@ -68,6 +68,7 @@ __pycache__/
 !ansisly/汇总/script/vae_augmentor.py
 !ansisly/汇总/script/grid_search_gate_prior.py
 !ansisly/汇总/script/grid_search_regularizers.py
+!ansisly/汇总/script/036_CasualModel.py
 
 
 # =============================================================================
