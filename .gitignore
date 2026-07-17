@@ -71,6 +71,23 @@ __pycache__/
 !ansisly/汇总/script/036_CasualModel.py
 
 
+# causal_meta_surv 核心包
+!ansisly/汇总/script/causal_meta_surv/__init__.py
+!ansisly/汇总/script/causal_meta_surv/augmentation.py
+!ansisly/汇总/script/causal_meta_surv/contracts.py
+!ansisly/汇总/script/causal_meta_surv/data.py
+!ansisly/汇总/script/causal_meta_surv/encoders.py
+!ansisly/汇总/script/causal_meta_surv/ensemble.py
+!ansisly/汇总/script/causal_meta_surv/evaluation.py
+!ansisly/汇总/script/causal_meta_surv/fusion.py
+!ansisly/汇总/script/causal_meta_surv/heads.py
+!ansisly/汇总/script/causal_meta_surv/losses.py
+!ansisly/汇总/script/causal_meta_surv/meta_trainer.py
+!ansisly/汇总/script/causal_meta_surv/preprocessing.py
+!ansisly/汇总/script/causal_meta_surv/serialization.py
+!ansisly/汇总/script/causal_meta_surv/sparse_gate.py
+!ansisly/汇总/script/causal_meta_surv/target_trainer.py
+
 # =============================================================================
 # 新增文件时：在 Layer 4 添加 !<具体路径> 即可
 # =============================================================================
