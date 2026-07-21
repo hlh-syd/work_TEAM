@@ -57,6 +57,25 @@ try:
 except ImportError:  # pragma: no cover - project environment includes sksurv
     HAS_SKSURV = False
 
+# ── 高级评价指标与出版级绘图 ──
+try:
+    from survival_metrics import SurvivalEvaluator
+    HAS_SURVIVAL_METRICS = True
+except ImportError:
+    HAS_SURVIVAL_METRICS = False
+
+try:
+    from publication_plots import (
+        setup_publication_style, save_figure,
+        plot_km_survival, plot_time_dependent_auc,
+        plot_calibration_curve as pub_plot_calibration,
+        plot_decision_curve as pub_plot_dca,
+        plot_composite_panel,
+    )
+    HAS_PUB_PLOTS = True
+except ImportError:
+    HAS_PUB_PLOTS = False
+
 try:
     from shared_utils import (
         ESSENTIAL_DIR,
@@ -3818,6 +3837,60 @@ def run_development_pipeline(
         ]
     )
     summary.to_csv(output_dir / "development_summary.tsv", sep="\t", index=False)
+
+    # ── 出版级图表生成 (Nature/Cell 风格) ──
+    if HAS_SURVIVAL_METRICS and HAS_PUB_PLOTS:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            setup_publication_style()
+            pub_dir = output_dir / "publication_quality"
+            pub_dir.mkdir(parents=True, exist_ok=True)
+            # 使用 OOF ensemble 风险评分
+            oof_risk = np.asarray(nested.oof_predictions["risk_ensemble"], dtype=float)
+            oof_time = np.asarray(target.time, dtype=float)
+            oof_event = np.asarray(target.event, dtype=int)
+            evaluator = SurvivalEvaluator(
+                oof_time, oof_event, oof_time, oof_event, oof_risk)
+            report = evaluator.full_report(
+                horizons=(12.0, 36.0, 60.0),
+                dca_horizon=config.eval_tau_months,
+                calibration_horizon=config.eval_tau_months)
+            # 保存完整指标
+            atomic_json_dump(
+                {k: v for k, v in report.items() if k not in ("calibration_data", "dca_data")},
+                pub_dir / "cmib_full_metrics.json")
+            # KM 曲线
+            fig_km = plot_km_survival(oof_time, oof_event, oof_risk,
+                                      title="CMIB-Surv OOF Risk Stratification")
+            save_figure(fig_km, str(pub_dir / "cmib_km"))
+            plt.close(fig_km)
+            # 校准曲线
+            cal_df = pd.DataFrame(report.get("calibration_data", []))
+            if not cal_df.empty:
+                fig_cal = pub_plot_calibration(cal_df, title="CMIB-Surv",
+                                               horizon=config.eval_tau_months)
+                save_figure(fig_cal, str(pub_dir / "cmib_calibration"))
+                plt.close(fig_cal)
+            # DCA
+            dca_df = pd.DataFrame(report.get("dca_data", []))
+            if not dca_df.empty:
+                fig_dca = pub_plot_dca(dca_df, title="CMIB-Surv")
+                save_figure(fig_dca, str(pub_dir / "cmib_dca"))
+                plt.close(fig_dca)
+            # 组合面板
+            fig_comp = plot_composite_panel(
+                oof_time, oof_event, oof_risk,
+                train_time=oof_time, train_event=oof_event,
+                cal_data=cal_df, dca_data=dca_df,
+                title="CMIB-Surv — Comprehensive Evaluation")
+            save_figure(fig_comp, str(pub_dir / "cmib_composite"))
+            plt.close(fig_comp)
+            LOGGER.info("Publication-quality figures saved to %s", pub_dir)
+        except Exception as e:
+            LOGGER.warning("Publication figure generation failed: %s", e)
+
     return {
         "output_dir": str(output_dir),
         "bundle": str(bundle_path),

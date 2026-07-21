@@ -84,6 +84,25 @@ try:
 except ImportError:
     HAS_SHAP = False
 
+# ── 高级评价指标与出版级绘图 ──
+try:
+    from survival_metrics import SurvivalEvaluator
+    HAS_SURVIVAL_METRICS = True
+except ImportError:
+    HAS_SURVIVAL_METRICS = False
+
+try:
+    from publication_plots import (
+        setup_publication_style, save_figure,
+        plot_km_survival, plot_time_dependent_auc,
+        plot_calibration_curve as pub_plot_calibration,
+        plot_decision_curve as pub_plot_dca,
+        plot_composite_panel,
+    )
+    HAS_PUB_PLOTS = True
+except ImportError:
+    HAS_PUB_PLOTS = False
+
 logger = setup_logger("031_cdsib")
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1198,6 +1217,56 @@ def plot_cdsib_results(
                     bbox_inches="tight")
         plt.close(fig)
     logger.info(f"[CDSIB] 可视化已保存到 {out_dir}")
+
+    # ── 出版级图表 (Nature/Cell 风格) ──
+    if HAS_SURVIVAL_METRICS and HAS_PUB_PLOTS:
+        try:
+            setup_publication_style()
+            pub_dir = os.path.join(out_dir, "publication_quality")
+            os.makedirs(pub_dir, exist_ok=True)
+            # 构建训练集数据用于 SurvivalEvaluator
+            # 使用验证集自身作为 train 参考 (CDSIB 无独立外部验证)
+            evaluator = SurvivalEvaluator(
+                val_times, val_events, val_times, val_events, risk)
+            report = evaluator.full_report(
+                horizons=(12.0, 36.0, 60.0),
+                dca_horizon=cfg.get("eval_tau_months", 36),
+                calibration_horizon=cfg.get("eval_tau_months", 36))
+            # 保存完整指标
+            import json as _json
+            with open(os.path.join(pub_dir, "cdsib_full_metrics.json"), "w") as _f:
+                _json.dump({k: v for k, v in report.items()
+                            if k not in ("calibration_data", "dca_data")},
+                           _f, indent=2, default=str)
+            # KM 曲线
+            fig_km = plot_km_survival(val_times, val_events, risk,
+                                      title="CDSIB Risk Stratification")
+            save_figure(fig_km, os.path.join(pub_dir, "cdsib_km"))
+            plt.close(fig_km)
+            # 校准曲线
+            cal_df = pd.DataFrame(report.get("calibration_data", []))
+            if not cal_df.empty:
+                fig_cal = pub_plot_calibration(cal_df, title="CDSIB",
+                                               horizon=cfg.get("eval_tau_months", 36))
+                save_figure(fig_cal, os.path.join(pub_dir, "cdsib_calibration"))
+                plt.close(fig_cal)
+            # DCA
+            dca_df = pd.DataFrame(report.get("dca_data", []))
+            if not dca_df.empty:
+                fig_dca = pub_plot_dca(dca_df, title="CDSIB")
+                save_figure(fig_dca, os.path.join(pub_dir, "cdsib_dca"))
+                plt.close(fig_dca)
+            # 组合面板
+            fig_comp = plot_composite_panel(
+                val_times, val_events, risk,
+                train_time=val_times, train_event=val_events,
+                cal_data=cal_df, dca_data=dca_df,
+                title="CDSIB — Comprehensive Evaluation")
+            save_figure(fig_comp, os.path.join(pub_dir, "cdsib_composite"))
+            plt.close(fig_comp)
+            logger.info(f"[CDSIB] 出版级图表已保存到 {pub_dir}")
+        except Exception as e:
+            logger.warning(f"[CDSIB] 出版级图表生成失败: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════

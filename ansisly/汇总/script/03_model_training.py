@@ -86,6 +86,26 @@ except ImportError:
     VAEAugmentor = None
     train_only_vae_augmentation = None
     HAS_VAE_AUGMENTOR = False
+
+# ── 高级评价指标与出版级绘图模块 ──
+try:
+    from survival_metrics import SurvivalEvaluator
+    HAS_SURVIVAL_METRICS = True
+except ImportError:
+    HAS_SURVIVAL_METRICS = False
+
+try:
+    from publication_plots import (
+        setup_publication_style, save_figure,
+        plot_km_survival, plot_time_dependent_auc,
+        plot_calibration_curve as pub_plot_calibration,
+        plot_decision_curve as pub_plot_dca,
+        plot_composite_panel,
+    )
+    HAS_PUB_PLOTS = True
+except ImportError:
+    HAS_PUB_PLOTS = False
+
 logger = setup_logger("03_model_training")
 
 
@@ -2902,6 +2922,66 @@ def main():
                 plot_dca(dca_df, "tcga_internal", model_name, fig_dir)
         except Exception as e:
             logger.info(f"[03] {model_name} plot generation failed: {e}")
+
+    # ── 出版级图表生成 (Nature/Cell 风格) ──
+    if HAS_SURVIVAL_METRICS and HAS_PUB_PLOTS:
+        pub_fig_dir = os.path.join(fig_dir, "publication_quality")
+        os.makedirs(pub_fig_dir, exist_ok=True)
+        setup_publication_style()
+        logger.info("[03] Generating publication-quality figures...")
+        for model_name, r in risk_all.items():
+            try:
+                valid_r = r[valid_mask]
+                evaluator = SurvivalEvaluator(
+                    train_time_arr, train_event_arr,
+                    valid_time_arr, valid_event_arr, valid_r)
+                # 完整评价报告
+                report = evaluator.full_report(
+                    horizons=(12.0, 36.0, 60.0),
+                    dca_horizon=min(36.0, _dyn_horizon),
+                    calibration_horizon=min(36.0, _dyn_horizon))
+                # 保存评价指标 JSON
+                import json as _json
+                _report_path = os.path.join(pub_fig_dir, f"{model_name}_full_metrics.json")
+                with open(_report_path, "w") as _f:
+                    _json.dump({k: v for k, v in report.items()
+                                if k not in ("calibration_data", "dca_data")},
+                               _f, indent=2, default=str)
+                # KM 生存曲线
+                fig_km = plot_km_survival(valid_time_arr, valid_event_arr, valid_r,
+                                          title=f"{model_name}")
+                save_figure(fig_km, os.path.join(pub_fig_dir, f"{model_name}_km"))
+                plt.close(fig_km)
+                # 时间依赖 AUC
+                if y_train_surv is not None and y_valid_surv is not None:
+                    fig_auc = plot_time_dependent_auc(
+                        y_train_surv, y_valid_surv, valid_r,
+                        title=f"{model_name} — Time-dependent AUC")
+                    save_figure(fig_auc, os.path.join(pub_fig_dir, f"{model_name}_tdauc"))
+                    plt.close(fig_auc)
+                # 校准曲线
+                cal_df = pd.DataFrame(report.get("calibration_data", []))
+                if not cal_df.empty:
+                    fig_cal = pub_plot_calibration(cal_df, title=f"{model_name}")
+                    save_figure(fig_cal, os.path.join(pub_fig_dir, f"{model_name}_calibration"))
+                    plt.close(fig_cal)
+                # DCA
+                dca_pub_df = pd.DataFrame(report.get("dca_data", []))
+                if not dca_pub_df.empty:
+                    fig_dca = pub_plot_dca(dca_pub_df, title=f"{model_name}")
+                    save_figure(fig_dca, os.path.join(pub_fig_dir, f"{model_name}_dca"))
+                    plt.close(fig_dca)
+                # 2x2 组合面板
+                fig_comp = plot_composite_panel(
+                    valid_time_arr, valid_event_arr, valid_r,
+                    train_time=train_time_arr, train_event=train_event_arr,
+                    cal_data=cal_df, dca_data=dca_pub_df,
+                    title=f"{model_name} — Comprehensive Evaluation")
+                save_figure(fig_comp, os.path.join(pub_fig_dir, f"{model_name}_composite"))
+                plt.close(fig_comp)
+                logger.info(f"[03] Publication figures saved for {model_name}")
+            except Exception as e:
+                logger.info(f"[03] {model_name} publication plot failed: {e}")
 
     risk_dist_data = {}
     for model_name, r in risk_all.items():

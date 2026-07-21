@@ -67,6 +67,25 @@ from causal_meta_surv.data import align_patient_ids
 from causal_meta_surv.preprocessing import FoldPreprocessorImpl, assert_no_leakage
 from causal_meta_surv.serialization import save_gene_panel_report
 
+# ── 高级评价指标与出版级绘图 ──
+try:
+    from survival_metrics import SurvivalEvaluator
+    HAS_SURVIVAL_METRICS = True
+except ImportError:
+    HAS_SURVIVAL_METRICS = False
+
+try:
+    from publication_plots import (
+        setup_publication_style, save_figure,
+        plot_km_survival, plot_time_dependent_auc,
+        plot_calibration_curve as pub_plot_calibration,
+        plot_decision_curve as pub_plot_dca,
+        plot_composite_panel,
+    )
+    HAS_PUB_PLOTS = True
+except ImportError:
+    HAS_PUB_PLOTS = False
+
 LOGGER = logging.getLogger("cmib_surv.main")
 
 
@@ -1700,6 +1719,54 @@ def run_phase7(
     LOGGER.info("  Per-model: %s", " ".join(log_parts))
     if baseline_c is not None:
         LOGGER.info("  Delta vs baseline: %.4f", metrics["delta_c_vs_baseline"])
+
+    # ── 出版级图表生成 (Nature/Cell 风格) ──
+    if HAS_SURVIVAL_METRICS and HAS_PUB_PLOTS:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            setup_publication_style()
+            pub_dir = output_dir / "publication_quality"
+            pub_dir.mkdir(parents=True, exist_ok=True)
+            evaluator = SurvivalEvaluator(
+                time_arr, event_arr, time_arr, event_arr, blended_risk)
+            report = evaluator.full_report(
+                horizons=(12.0, 36.0, 60.0),
+                dca_horizon=36.0,
+                calibration_horizon=36.0)
+            # 保存完整指标
+            save_json(
+                {k: v for k, v in report.items() if k not in ("calibration_data", "dca_data")},
+                pub_dir / "cmib_surv_full_metrics.json")
+            # KM 曲线
+            fig_km = plot_km_survival(time_arr, event_arr, blended_risk,
+                                      title="CMIB-Surv OOF Ensemble")
+            save_figure(fig_km, str(pub_dir / "cmib_surv_km"))
+            plt.close(fig_km)
+            # 校准曲线
+            cal_df = pd.DataFrame(report.get("calibration_data", []))
+            if not cal_df.empty:
+                fig_cal = pub_plot_calibration(cal_df, title="CMIB-Surv", horizon=36.0)
+                save_figure(fig_cal, str(pub_dir / "cmib_surv_calibration"))
+                plt.close(fig_cal)
+            # DCA
+            dca_df = pd.DataFrame(report.get("dca_data", []))
+            if not dca_df.empty:
+                fig_dca = pub_plot_dca(dca_df, title="CMIB-Surv")
+                save_figure(fig_dca, str(pub_dir / "cmib_surv_dca"))
+                plt.close(fig_dca)
+            # 组合面板
+            fig_comp = plot_composite_panel(
+                time_arr, event_arr, blended_risk,
+                train_time=time_arr, train_event=event_arr,
+                cal_data=cal_df, dca_data=dca_df,
+                title="CMIB-Surv — Comprehensive Evaluation")
+            save_figure(fig_comp, str(pub_dir / "cmib_surv_composite"))
+            plt.close(fig_comp)
+            LOGGER.info("Publication-quality figures saved to %s", pub_dir)
+        except Exception as e:
+            LOGGER.warning("Publication figure generation failed: %s", e)
 
     return metrics
 
